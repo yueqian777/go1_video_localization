@@ -60,6 +60,7 @@ class Gui:
                 value = options[0]
             result = SimpleNamespace(value=value, options=options, visible=kwargs.get('visible', True))
             result.on_click = lambda cb: setattr(result, 'click', cb)
+            result.on_update = lambda cb: setattr(result, 'update', cb)
             return result
         return add
 

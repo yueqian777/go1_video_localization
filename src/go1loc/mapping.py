@@ -20,7 +20,8 @@ from typing import Any
 from uuid import uuid4
 
 from .dependencies import git_revision
-from .events import BoundedEventWriter, outside_artifacts
+from .build_watch import atomic_json, publish_run
+from .events import BoundedEventWriter, outside_artifacts, utc_now
 from .pipeline_errors import PipelineInputError, PipelineUnavailable
 from .snapshots import SnapshotPublisher, run_incremental_mapping
 from .video import sha256_file
@@ -145,7 +146,7 @@ def _connected_components(model) -> list[list[int]]:
     return sorted(components, key=len, reverse=True)
 
 
-def _write_manifest(output_dir: Path, config: MappingConfig, image_dir: Path, model, refs: list[str], timings: dict[str, float], retrieval_features: Path | None, local_features: Path, retrieval_mode: str) -> dict[str, Any]:
+def _write_manifest(output_dir: Path, config: MappingConfig, image_dir: Path, model, refs: list[str], timings: dict[str, float], retrieval_features: Path | None, local_features: Path, retrieval_mode: str, *, run_id: str | None = None) -> dict[str, Any]:
     components = _connected_components(model)
     component_records = [
         {"component_id": f"{config.map_id}:component:{i}", "image_ids": ids, "num_images": len(ids)}
@@ -161,6 +162,7 @@ def _write_manifest(output_dir: Path, config: MappingConfig, image_dir: Path, mo
     manifest = {
         "schema_version": "go1loc.map.v1",
         "map_id": config.map_id,
+        "build_run_id": run_id,
         "frozen": True,
         "image_dir": str(image_dir.resolve()),
         "reference_images": refs,
@@ -199,9 +201,7 @@ def _write_manifest(output_dir: Path, config: MappingConfig, image_dir: Path, mo
     manifest["manifest_sha256"] = hashlib.sha256(
         json.dumps(manifest, sort_keys=True, ensure_ascii=False).encode("utf-8")
     ).hexdigest()
-    (output_dir / "map_manifest.json").write_text(
-        json.dumps(manifest, indent=2, ensure_ascii=False), encoding="utf-8"
-    )
+    atomic_json(output_dir / 'map_manifest.json', manifest)
     return manifest
 
 
@@ -292,23 +292,47 @@ def build_map(image_dir: Path, output_dir: Path, config: MappingConfig | None = 
         raise PipelineInputError('invalid_event_run_id')
     run_dir.mkdir(parents=True, exist_ok=False)
     events = events or BoundedEventWriter(run_dir / 'events.jsonl', run_id=run_dir.name, map_id=config.map_id)
+    run = {'schema_version': 'go1loc.build_run.v1', 'run_id': events.run_id,
+           'map_id': config.map_id, 'image_dir': str(image_dir), 'output_dir': str(output_dir),
+           'events_path': str(events.path), 'scale_status': 'arbitrary_monocular_scale',
+           'units': 'map_units', 'status': 'running', 'stage': 'initializing',
+           'failure_reason': None, 'created_at': utc_now(), 'execution_permitted': False,
+           'snapshot_frames_freq': config.snapshot_frames_freq,
+           'source_kind': 'not_yet_inspected', 'map_observation_time': config.map_observation_time}
+    # Publication precedes image preparation, native imports and feature work.
+    # It is not a frozen map and does not authorize a final model read.
+    publish_run(run_dir, run)
     stage_dir = None
-    with events.stage('mapping'):
-        try:
+    try:
+        with events.stage('mapping'):
             refs = _images(image_dir)
             if len(refs) < 2:
                 raise PipelineInputError('mapping_requires_at_least_two_images')
             refs, frame_times, frame_data = _video_references(image_dir, refs)
+            run.update(source_kind='video_pts_extracted_frames' if frame_data is not None else 'unordered_images',
+                       num_reference_images=len(refs), stage='mapping')
+            publish_run(run_dir, run)
             stage_dir = _ascii_stage(image_dir, refs)
             manifest = _build_map(image_dir, output_dir, config, refs, frame_times, frame_data,
                                   stage_dir or image_dir, run_dir, events)
-        finally:
-            if stage_dir:
-                shutil.rmtree(stage_dir, ignore_errors=True)
-    events.emit('final', stage='mapping', registered_images=manifest.get('num_registered_images'),
-                points3D=manifest.get('num_points3D'), data={'map_manifest': str(output_dir / 'map_manifest.json'),
-                'mode': 'final_map', 'sidecar_dir': str(run_dir),
-                'build_snapshots_available': bool(manifest.get('timing_s', {}).get('snapshot_count', 0))})
+        events.emit('final', stage='mapping', registered_images=manifest.get('num_registered_images'),
+                    points3D=manifest.get('num_points3D'), data={'map_manifest': str(output_dir / 'map_manifest.json'),
+                    'mode': 'final_map', 'sidecar_dir': str(run_dir),
+                    'build_snapshots_available': bool(manifest.get('timing_s', {}).get('snapshot_count', 0))})
+        run.update(status='completed', stage='mapping', finished_at=utc_now(),
+                   final_manifest_sha256=manifest.get('manifest_sha256'))
+        publish_run(run_dir, run)
+    except BaseException as exc:
+        run.update(status='cancelled' if isinstance(exc, KeyboardInterrupt) else 'failed',
+                   failure_reason=type(exc).__name__ + ': ' + str(exc)[:1000], finished_at=utc_now())
+        try:
+            publish_run(run_dir, run)
+        except Exception as metadata_error:
+            exc.add_note('Failed to persist run status: ' + str(metadata_error)[:256])
+        raise
+    finally:
+        if stage_dir:
+            shutil.rmtree(stage_dir, ignore_errors=True)
     return manifest
 
 
@@ -392,5 +416,6 @@ def _build_map(image_dir, output_dir, config, refs, frame_times, frame_data, wor
     timings['snapshot_count'] = publisher.count if publisher else 0
     # Native snapshot write duration is unavailable from the verified 4.2.1 API.
     # This measures publication overhead only, not an invented total UI overhead.
-    manifest = _write_manifest(output_dir, config, image_dir, model, refs, timings, global_path, local_path, retrieval_mode)
+    manifest = _write_manifest(output_dir, config, image_dir, model, refs, timings, global_path, local_path,
+                               retrieval_mode, run_id=events.run_id)
     return manifest

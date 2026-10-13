@@ -124,6 +124,8 @@ class SnapshotPublisher:
                    'points3D': int(model.num_points3D()), 'model_sha256': before,
                    'frames': frames, 'frame_order': 'unordered_use_pts_for_video_time',
                    'exposure_time': None, 'timing_source': 'video_pts_not_exposure_time'}
+            row['snapshot_sha256'] = hashlib.sha256(json.dumps(
+                row, sort_keys=True, ensure_ascii=False, allow_nan=False).encode('utf-8')).hexdigest()
             encoded = json.dumps(row, ensure_ascii=False, allow_nan=False, indent=2).encode('utf-8')
             if self.bytes_written + source_bytes + len(encoded) > self.max_bytes:
                 self.exhausted = True
@@ -153,17 +155,38 @@ class SnapshotPublisher:
             self.overhead_s += time.perf_counter() - started
 
 
+def read_ready_snapshot(directory: Path) -> dict:
+    """Validate the atomic READY marker and all five native files, never a live model.
+
+    The checksum is additive: legacy frozen-map viewers may read pre-checksum
+    snapshots. Standalone first-build monitoring requires the new checksum.
+    """
+    directory = Path(directory)
+    marker = directory / 'READY.json'
+    if directory.is_symlink() or marker.is_symlink():
+        raise SnapshotError('invalid_ready_snapshot')
+    try:
+        row = json.loads(marker.read_text(encoding='utf-8'))
+        if (row.get('mode') != 'build_snapshot'
+                or Path(row['snapshot_path']).resolve() != directory.resolve()
+                or row.get('model_sha256') != _file_hashes(directory)):
+            raise SnapshotError('invalid_ready_snapshot')
+        if row.get('snapshot_sha256'):
+            unsigned = {k: v for k, v in row.items() if k != 'snapshot_sha256'}
+            digest = hashlib.sha256(json.dumps(unsigned, sort_keys=True,
+                                ensure_ascii=False, allow_nan=False).encode('utf-8')).hexdigest()
+            if digest != row['snapshot_sha256']:
+                raise SnapshotError('invalid_snapshot_metadata_hash')
+    except (OSError, ValueError, KeyError, TypeError) as exc:
+        raise SnapshotError('invalid_ready_snapshot:' + str(exc)[:200]) from exc
+    return row
+
+
 def list_ready_snapshots(root: Path) -> list[dict]:
     """No snapshots means no build view; never synthesize one from a final map."""
     rows = []
     for marker in sorted(Path(root).glob('snapshot-*/READY.json')):
-        row = json.loads(marker.read_text(encoding='utf-8'))
-        if (row.get('mode') != 'build_snapshot' or marker.is_symlink()
-                or marker.parent.is_symlink()
-                or Path(row['snapshot_path']).resolve() != marker.parent.resolve()
-                or row.get('model_sha256') != _file_hashes(marker.parent)):
-            raise SnapshotError('invalid_ready_snapshot')
-        rows.append(row)
+        rows.append(read_ready_snapshot(marker.parent))
     return rows
 
 

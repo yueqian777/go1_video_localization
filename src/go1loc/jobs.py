@@ -20,9 +20,12 @@ from uuid import uuid4
 KINDS = {
     'inspect_map': {'component_id', 'point_budget'},
     'inspect_snapshot': {'snapshot_dir', 'snapshot_index', 'point_budget'},
+    'inspect_build_snapshot': {'run_dir', 'snapshot_index', 'point_budget'},
     'locate_object': {'photo', 'roi', 'mask_path', 'query_dir', 'cluster_radius', 'min_points', 'config'},
     'localize_current': {'photo', 'config'},
-    'plan_route': {'graph_path', 'start', 'target'},
+    'plan_route': {'graph_path', 'start', 'target', 'time_mode', 'replay_reference_time'},
+    'prepare_route_review': {'max_gap_s'},
+    'save_route_review': {'input_sha256', 'decisions', 'max_gap_s', 'component_id'},
 }
 
 
@@ -242,6 +245,15 @@ def execute_job(request):
         payload = scene_payload(map_dir, **params)
         path = output/'scene.json'
         atomic_json(path, payload)
+    elif kind == 'inspect_build_snapshot':
+        from .build_watch import read_build_state, snapshot_scene_payload
+        state = read_build_state(Path(params['run_dir']))
+        if Path(state['run']['output_dir']).resolve() != map_dir.resolve():
+            raise ValueError('build_run_output_mismatch')
+        payload = snapshot_scene_payload(Path(params['run_dir']),
+                    snapshot_index=int(params.get('snapshot_index', -1)), point_budget=params.get('point_budget', 50000))
+        path = output/'scene.json'
+        atomic_json(path, payload)
     elif kind == 'inspect_snapshot':
         from .snapshots import list_ready_snapshots
         snapshots = list_ready_snapshots(Path(params['snapshot_dir']))
@@ -257,6 +269,15 @@ def execute_job(request):
         payload = scene_payload(map_dir, snapshot=snapshot, point_budget=params.get('point_budget', 50000))
         path = output/'scene.json'
         atomic_json(path, payload)
+    elif kind == 'prepare_route_review':
+        from .route_workflow import prepare_review
+        path = output/'route_review.json'
+        atomic_json(path, prepare_review(map_dir, **params))
+    elif kind == 'save_route_review':
+        from .route_workflow import save_review
+        payload = save_review(map_dir, output/'reviewed', **params)
+        path = output/'review_outputs.json'
+        atomic_json(path, payload)
     elif kind == 'locate_object':
         from .photo_object import locate_photo_object
         kwargs = {k: v for k, v in params.items() if k not in ('photo', 'config')}
@@ -270,7 +291,9 @@ def execute_job(request):
         graph = read_json(params['graph_path'])
         if graph.get('map_id') != manifest['map_id'] or graph.get('map_hash') != manifest['manifest_sha256']:
             raise ValueError('planning_graph_map_mismatch')
-        payload = plan_route(graph, params['start'], params['target'], now=utc_now())
+        payload = plan_route(graph, params['start'], params['target'], now=utc_now(),
+                    time_mode=params.get('time_mode', 'live_current'),
+                    replay_reference_time=params.get('replay_reference_time'))
         path = output/'planning_result.json'
         atomic_json(path, payload)
     else:  # fixed localize_current entry, no arbitrary import or command

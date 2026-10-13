@@ -18,6 +18,7 @@ from uuid import uuid4
 import numpy as np
 
 from .jobs import JobManager, atomic_json, ensure_sidecar, read_json, utc_now
+from .viewer_workflows import RouteWorkflowControls
 
 POINT_BUDGET = 50000
 PHOTO_PLANE_Z = 10000.0
@@ -302,7 +303,15 @@ class SceneController:
             self.pose('goal', payload['goal_observation_pose'], color=(80, 230, 110), label='Goal observation camera')
 
 
-class ViewerApplication:
+def _app_locked(method):
+    @wraps(method)
+    def locked(self, *args, **kwargs):
+        with self._state_lock:
+            return method(self, *args, **kwargs)
+    return locked
+
+
+class ViewerApplication(RouteWorkflowControls):
     def __init__(self, map_dir, sidecar_dir, *, port=8765, query_dir=None, snapshot_dir=None, server=None):
         self.map_dir = Path(map_dir).resolve()
         self.sidecar = ensure_sidecar(self.map_dir, sidecar_dir)
@@ -317,6 +326,11 @@ class ViewerApplication:
                 raise RuntimeError('Optional UI missing: install viser==1.1.1 in the project runtime') from exc
             server = viser.ViserServer(host='127.0.0.1', port=port, label='Go1 offline evidence viewer')
         self.server = server
+        self._state_lock = threading.RLock()
+        self._task_revision = 0
+        self._job_revisions = {}
+        self.query_result = None
+        self._query_selected = False
         self.jobs = JobManager(self.map_dir, self.sidecar)
         self.controller = SceneController(server)
         self.controller.on_reference_click = self._reference_clicked
@@ -341,7 +355,8 @@ class ViewerApplication:
     def _guard(self, callback):
         def guarded(event):
             try:
-                callback(event)
+                with self._state_lock:
+                    callback(event)
             except Exception as exc:
                 self._message(f'{type(exc).__name__}: {exc}')
         return guarded
@@ -387,6 +402,7 @@ class ViewerApplication:
         self._button('Localize independent current photo', self._localize_current)
         self._button('Use selected reference as MANUAL start', self._manual_start)
         self.graph_path = gui.add_text('Verified route_graph JSON path', '')
+        self._workflow_ui()
         self._button('Compute route preview from start + target', self._plan_route)
         self.plan_path = gui.add_text('Saved planning_result JSON path', '')
         self._button('Load route preview JSON', self._load_plan)
@@ -395,6 +411,7 @@ class ViewerApplication:
 
     def _submit(self, kind, params, role=None):
         job = self.jobs.submit(kind, params)
+        self._job_revisions[job['job_id']] = self._task_revision
         self._job_roles[job['job_id']] = role or kind
         self._message(f"Queued {kind}; job={job['job_id']}. Browser disconnect does not cancel it.")
         return job
@@ -418,12 +435,23 @@ class ViewerApplication:
                 self._message(f'{type(exc).__name__}: {exc}')
             self._stop.wait(.5)
 
+    @_app_locked
     def _completed(self, state):
+        if (state.get('job_id') is not None and state['kind'] not in ('inspect_map', 'inspect_snapshot')
+                and self._job_revisions.get(state['job_id']) != self._task_revision):
+            self._message('Ignored completed job from an obsolete task; saved files retained: '+state['job_id'])
+            return
+        if state['kind'] in ('prepare_route_review', 'save_route_review') and not self._review_completion_current(state):
+            self._message('Ignored obsolete review generation/save; current decisions kept, saved files retained: '+state['job_id'])
+            return
         result_path = Path(state['result_path'])
         payload = read_json(result_path)
         kind = state['kind']
         if kind in ('inspect_map', 'inspect_snapshot'):
+            self._invalidate_target(clear_query=True)
+            self._query_selected = False
             self.controller.replace_model(payload)
+            self._reset_workflows()
             self.plan_result = self.current_start = None
             self.target_result = None
             self.frame.options = [c['name'] for c in payload['cameras']] or ['(no frames)']
@@ -439,6 +467,14 @@ class ViewerApplication:
                 self.load_query(pending)
         elif kind == 'locate_object':
             self.load_object(result_path)
+        elif kind == 'prepare_route_review':
+            self._set_review(payload)
+            self._message('PENDING candidates generated. Review source / PTS / registration before confirming.\n'+str(result_path))
+        elif kind == 'save_route_review':
+            self._workflow_context_changed(None)
+            self.graph_path.value = payload['graph_path']
+            self._message(f"Saved {payload['confirmed_segments']} reviewed segments, {payload['edges']} directed edges.\n"+
+                          json.dumps(payload, ensure_ascii=False))
         elif kind == 'plan_route':
             self.plan_result = None
             self.controller.clear('route')
@@ -450,14 +486,12 @@ class ViewerApplication:
                 self._message('Computed camera route preview; execution_permitted=false.\n'+str(result_path))
             else:
                 self._message('Route rejected: '+str(payload.get('failure_reason'))+'\n'+str(result_path))
-        else:
-            self.controller.load_query(payload, current=True)
-            self.current_start = {**payload, 'source': 'current_photo',
-                'captured_at': payload.get('capture_time'), 'localized_at': payload.get('localization_time'),
-                'photo_sha256': payload.get('query_sha256'),
-                'T_MC': payload.get('T_WC_query')}
-            atomic_json(self.sidecar/('current_start-'+uuid4().hex+'.json'), self.current_start)
+        elif kind == 'localize_current':
+            self._apply_current(payload)
+            self.current_query.value = str(result_path.parent)
             self._message('Independent current camera localized. No automatic route attachment.\n'+str(result_path))
+        else:
+            raise ValueError('unknown_completed_job_kind')
 
     def _connect(self, client):
         self.controller.on_client_connect(client)
@@ -564,21 +598,47 @@ class ViewerApplication:
         if self.controller.mode != 'final_map_replay' or not self.controller.model:
             raise ValueError('final_map_required: snapshot_alignment_not_established')
 
-    def _locate_object(self, _):
-        self._require_final()
-        self.controller.clear('support')
+    def _invalidate_plan(self):
+        self._task_revision += 1
+        self.plan_result = None
         self.controller.clear('route')
         self.controller.clear('goal')
-        self.plan_result = None
+        self.plan_path.value = ''
+
+    def _invalidate_target(self, *, clear_query=False):
+        self._invalidate_plan()
+        self._clear_connection_preview()
         self.target_result = None
+        self.target_photo = None
+        self.object_path.value = ''
+        self.controller.clear('support')
+        if clear_query:
+            self.query_result = None
+            self.controller.clear('query')
+            self.evidence_image.visible = False
+            for photo_state in self._photo_states.values():
+                photo_state['handle'].remove()
+            self._photo_states.clear()
+            for client in self.server.get_clients().values():
+                self._focus_map(client)
+
+    def _locate_object(self, _):
+        self._require_final()
+        self._invalidate_target(clear_query=True)
         self._submit('locate_object', {'photo': str(Path(self.photo.value).resolve()),
             'roi': [*self.roi_min.value, *self.roi_max.value],
             'query_dir': self.query_path.value.strip() or None, 'mask_path': self.mask_path.value.strip() or None,
             'cluster_radius': float(self.cluster_radius.value) or None,
             'min_points': int(self.minimum_points.value), 'config': self._config()})
 
+    @_app_locked
     def load_query(self, directory):
         self._require_final()
+        # Clear dependants BEFORE I/O: an unreadable/failed B must not leave A active.
+        self._invalidate_target(clear_query=True)
+        self._query_selected = True
+        self.photo.value = ''
+        self.query_path.value = str(directory)
         payload = read_json(Path(directory)/'localization_result.json')
         if any(payload.get(k) != self.controller.model[k] for k in ('map_id', 'map_hash')):
             raise ValueError('query_map_mismatch')
@@ -590,6 +650,7 @@ class ViewerApplication:
                 self.target_photo = Path(evidence['query_path']).resolve()
         self.query_path.value = str(directory)
         self._show_evidence(Path(directory))
+        self.query_result = payload
         if payload.get('pose_status') != 'localized':
             self.controller.clear('query')
             self.controller.clear('support')
@@ -613,19 +674,18 @@ class ViewerApplication:
         self.evidence_image.image = _read_image(destination, 1600)
         self.evidence_image.visible = True
 
+    @_app_locked
     def load_object(self, path):
         self._require_final()
-        self.target_result = None
-        self.controller.clear('support')
-        self.controller.clear('route')
-        self.controller.clear('goal')
-        self.plan_result = None
+        self._invalidate_target(clear_query=True)
         payload = read_json(path)
         if payload.get('query_dir'):
             self.target_photo = Path(payload['query_path']).resolve()
             self.photo.value = str(self.target_photo)
             query_dir = Path(payload['query_dir'])
             self.load_query(query_dir)  # verifies evidence bindings before rendering
+            if self.query_result.get('pose_status') != 'localized':
+                raise ValueError('object_query_not_localized')
             evidence = read_json(query_dir/'query_evidence.json')
             from .evidence import digest_json
             binding = payload.get('roi_binding', {})
@@ -647,7 +707,8 @@ class ViewerApplication:
         self.controller.clear('goal')
         self.plan_result = None
         self._submit('plan_route', {'graph_path': str(Path(self.graph_path.value).resolve()),
-                                   'start': self.current_start, 'target': self.target_result})
+                                   'start': self.current_start, 'target': self.target_result,
+                                   **self._planning_time()})
 
     def _localize_current(self, _):
         self._require_final()
@@ -661,6 +722,8 @@ class ViewerApplication:
         if not stamp.tzinfo:
             raise ValueError('capture_time_requires_timezone')
         self.current_start = None
+        self._invalidate_plan()
+        self._clear_connection_preview()
         self.controller.clear('start')
         self.controller.clear('route')
         self.controller.clear('goal')
@@ -670,6 +733,8 @@ class ViewerApplication:
     def _manual_start(self, _):
         self._require_final()
         camera = self._reference()
+        self._invalidate_plan()
+        self._clear_connection_preview()
         self.controller.clear('route')
         self.controller.clear('goal')
         self.plan_result = None
@@ -683,6 +748,9 @@ class ViewerApplication:
 
     def _load_plan(self, _):
         payload = read_json(self.plan_path.value)
+        if self._query_selected:
+            if self.target_result is None or payload.get('target_object_result') != self.target_result:
+                raise ValueError('saved_plan_not_bound_to_current_target')
         self.plan_result = None
         self.controller.load_plan(payload)
         self.plan_result = payload

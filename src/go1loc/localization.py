@@ -220,6 +220,9 @@ def localize_photo(query_path: Path, map_dir: Path, output_dir: Path, config: Lo
                     'capture_time': result.capture_time, 'localization_time': result.localization_time,
                     'map_observation_time': manifest.get('map_observation_time'),
                     'failure_reason': result.failure_reason, 'clusters': all_evidence}
+        # Bind exported pose/quality/times as well as image and feature files.
+        # Saved current-start import must not accept a hand-edited XYZ result.
+        evidence['localization_result_sha256'] = digest_json(result.to_dict())
         evidence['evidence_sha256'] = digest_json(evidence)
         write_json(output_dir/'query_evidence.json', evidence)
         return _save_result(output_dir, result)

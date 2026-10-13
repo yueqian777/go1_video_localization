@@ -19,6 +19,7 @@ import numpy as np
 
 
 IDENTITY = ("map_id", "map_hash", "component_id")
+PHOTO_BINDING = (*IDENTITY, "query_id", "photo_sha256", "captured_at", "localized_at")
 SOURCE_KINDS = {"video", "synthetic_test"}
 POSE_ATOL = 1e-7  # Numerical consistency, NOT a physical snapping radius.
 
@@ -89,6 +90,41 @@ def _time(value: Any) -> datetime:
     if parsed.tzinfo is None or parsed.utcoffset() is None:
         raise ValueError("timezone_aware_iso_time_required")
     return parsed
+
+
+def _time_context(now: str, time_mode: str, replay_reference_time: str | None) -> tuple[datetime, datetime]:
+    """Actual runtime never becomes replay time. No internal system-clock reads."""
+    runtime = _time(now)
+    if time_mode == "live_current":
+        if replay_reference_time is not None:
+            raise ValueError("replay_reference_not_allowed_in_live_current")
+        return runtime, runtime
+    if time_mode != "offline_replay":
+        raise ValueError("invalid_time_mode")
+    if replay_reference_time is None:
+        raise ValueError("replay_reference_time_required")
+    reference = _time(replay_reference_time)
+    if reference > runtime:
+        raise ValueError("replay_reference_after_runtime")
+    return runtime, reference
+
+
+def _valid_graph(graph: dict) -> bool:
+    try:
+        return (graph.get("schema_version") == "go1loc.route_graph.v1"
+                and graph.get("graph_sha256") == _digest({k: v for k, v in graph.items()
+                                                         if k != "graph_sha256"}))
+    except (TypeError, ValueError, AttributeError):
+        return False
+
+
+def _camera_pose(value: dict) -> list:
+    """Accept the legacy alias only when both supplied aliases agree."""
+    pose = _rigid(value.get("T_MC", value.get("T_WC_query")))
+    if "T_MC" in value and "T_WC_query" in value:
+        if not np.allclose(pose, _rigid(value["T_WC_query"]), atol=POSE_ATOL, rtol=0):
+            raise ValueError("conflicting_pose_aliases")
+    return pose.tolist()
 
 
 def _frame_name(row: dict) -> str | None:
@@ -259,7 +295,8 @@ def _identity_failure(value: dict, graph: dict) -> str | None:
 
 
 def _start_connection(graph: dict, start: dict, target: dict, now: datetime,
-                      max_age: float) -> tuple[str | None, list, dict | None, list | None, str | None]:
+                      max_age: float, reference_time: datetime | None = None
+                      ) -> tuple[str | None, list, dict | None, list | None, str | None]:
     """Return node, prefix path, provenance, camera pose, rejection reason."""
     source = start.get("source")
     if source not in {"explicit_pose", "current_photo"}:
@@ -269,9 +306,11 @@ def _start_connection(graph: dict, start: dict, target: dict, now: datetime,
     try:
         captured = _time(start.get("selected_at") if source == "explicit_pose" else start.get("captured_at"))
         localized = captured if source == "explicit_pose" else _time(start.get("localized_at"))
-        if captured > localized or localized > now:
+        # A manual historical-node selection is made NOW, not at photo exposure.
+        reference = now if source == "explicit_pose" else (reference_time or now)
+        if captured > localized or localized > now or captured > reference:
             raise ValueError("unordered_times")
-        if (now - captured).total_seconds() > max_age:
+        if (reference - captured).total_seconds() > max_age:
             return None, [], None, None, "stale_start"
     except (TypeError, ValueError):
         return None, [], None, None, "invalid_start_time"
@@ -291,7 +330,7 @@ def _start_connection(graph: dict, start: dict, target: dict, now: datetime,
                     "node_id": node["node_id"], "selected_at": start["selected_at"]}
         return node["node_id"], [_position(node["T_MC"])], evidence, node["T_MC"], None
     try:
-        camera = _rigid(start.get("T_MC", start.get("T_WC_query"))).tolist()
+        camera = _camera_pose(start)
     except ValueError:
         return None, [], None, None, "invalid_start_pose"
     if (not isinstance(start.get("query_id"), str) or not start["query_id"]
@@ -319,6 +358,9 @@ def _start_connection(graph: dict, start: dict, target: dict, now: datetime,
                    (*IDENTITY, "query_id", "photo_sha256", "captured_at", "localized_at"))):
         return None, [], None, camera, "start_not_connected"
     try:
+        if "T_MC" in connection or "T_WC_query" in connection:
+            if not np.allclose(_camera_pose(connection), camera, atol=POSE_ATOL, rtol=0):
+                raise ValueError("attachment_pose_mismatch")
         path = np.asarray(connection["path"], dtype=float)
         times = [_number(t) for t in connection["pts_time_s"]]
         if (path.ndim != 2 or path.shape[1] != 3 or len(path) < 2 or not np.isfinite(path).all()
@@ -330,6 +372,165 @@ def _start_connection(graph: dict, start: dict, target: dict, now: datetime,
     except (KeyError, TypeError, ValueError):
         return None, [], None, camera, "start_not_connected"
     return node["node_id"], path.tolist(), connection, camera, None
+
+
+def _missing_start_fields(start: dict) -> list[str]:
+    fields = [*IDENTITY, "source"]
+    if start.get("source") == "current_photo":
+        fields += ["pose_status", "query_id", "photo_sha256", "captured_at", "localized_at", "quality"]
+        if "T_MC" not in start and "T_WC_query" not in start:
+            fields.append("T_MC")
+    elif start.get("source") == "explicit_pose":
+        fields += ["manual", "node_id", "selected_at"]
+    missing = [field for field in fields if start.get(field) is None or start.get(field) == ""]
+    if start.get("source") == "current_photo":
+        attachment = start.get("attachment")
+        if not isinstance(attachment, dict) or not attachment:
+            missing.append("attachment")
+        else:
+            for field in (*PHOTO_BINDING, "kind", "verified_continuous", "source_kind",
+                          "source_sha256", "evidence_id", "node_id", "units", "path", "pts_time_s"):
+                if attachment.get(field) is None or attachment.get(field) == "":
+                    missing.append("attachment." + field)
+    return missing
+
+
+def _attachment_reasons(graph: dict, start: dict) -> list[str]:
+    """Explain an existing rejection; this helper never approves a connection."""
+    attachment = start.get("attachment")
+    if not isinstance(attachment, dict) or not attachment:
+        return ["attachment_required"]
+    reasons = []
+    if attachment.get("verified_continuous") is not True:
+        reasons.append("attachment_continuity_not_verified")
+    if attachment.get("kind") != "verified_temporal_connection":
+        reasons.append("attachment_kind_invalid")
+    if attachment.get("source_kind") not in SOURCE_KINDS:
+        reasons.append("attachment_source_kind_invalid")
+    if not _sha256(attachment.get("source_sha256")):
+        reasons.append("attachment_source_hash_invalid")
+    if attachment.get("node_id") not in graph["nodes"]:
+        reasons.append("attachment_node_not_in_graph")
+    if attachment.get("units") != graph["units"]:
+        reasons.append("attachment_units_mismatch")
+    for field in PHOTO_BINDING:
+        if attachment.get(field) != start.get(field):
+            reasons.append("attachment_" + field + "_mismatch")
+    if not reasons:
+        reasons.append("attachment_geometry_timing_or_evidence_invalid")
+    return reasons
+
+
+def validate_start_connection(graph: dict, start: dict, *, now: str,
+                              time_mode: str = "live_current", replay_reference_time: str | None = None,
+                              target: dict | None = None, max_start_age_s: float = 30.0) -> dict:
+    """GUI preview of the SAME identity/time/geometry gate used by plan_route.
+
+    Invalid time configuration raises ValueError. Business rejection returns no
+    drawable path; ``missing`` names absent fields and ``reasons`` gives the gate.
+    Inputs must originate from verified map/localization readers; hashes are not
+    signatures and this pure function cannot authenticate an evidence statement.
+    """
+    runtime, reference = _time_context(now, time_mode, replay_reference_time)
+    age = _number(max_start_age_s)
+    if age < 0:
+        raise ValueError("invalid_max_start_age_s")
+    result = {"valid": False, "node_id": None, "path": [], "evidence": None,
+              "camera_pose": None, "missing": [], "reasons": [],
+              "time_mode": time_mode, "replay_reference_time": replay_reference_time,
+              "run_at": now, "execution_permitted": False}
+    if not _valid_graph(graph):
+        result["reasons"] = ["invalid_graph"]
+        return result
+    if not isinstance(start, dict) or (target is not None and not isinstance(target, dict)):
+        result["reasons"] = ["invalid_start_or_target_document"]
+        return result
+    result["missing"] = _missing_start_fields(start)
+    reason = _identity_failure(start, graph)
+    if not reason and target is not None:
+        reason = _identity_failure(target, graph)
+    if reason:
+        result["reasons"] = [reason]
+        return result
+    try:
+        node, path, evidence, camera, reason = _start_connection(
+            graph, start, target or {}, runtime, age, reference)
+    except (TypeError, ValueError, KeyError, AttributeError):
+        result["reasons"] = ["invalid_start_document"]
+        return result
+    result["camera_pose"] = deepcopy(camera)
+    if reason:
+        result["reasons"] = [reason]
+        if reason == "start_not_connected" and start.get("source") == "current_photo":
+            result["reasons"].extend(_attachment_reasons(graph, start))
+    else:
+        result.update(valid=True, node_id=node, path=deepcopy(path), evidence=deepcopy(evidence))
+    return result
+
+
+def import_current_start(current: dict, imported: dict, graph: dict, *, now: str,
+                         time_mode: str = "live_current", replay_reference_time: str | None = None,
+                         max_start_age_s: float = 30.0) -> dict:
+    """Bind an imported attachment to the CURRENT independently verified photo.
+
+    Accept a full start, bare attachment, or {attachment: ...}. Return a report
+    with start=None on rejection; never replace pose, quality, identity or times.
+    Attachment-only imports require the full T_MC (legacy T_WC_query accepted),
+    so matching translation alone cannot bind a different camera orientation.
+    """
+    options = dict(now=now, time_mode=time_mode, replay_reference_time=replay_reference_time,
+                   max_start_age_s=max_start_age_s)
+    authority = deepcopy(current) if isinstance(current, dict) else {}
+    authority.pop("attachment", None)
+    report = validate_start_connection(graph, authority, **options)
+    report["start"] = None
+
+    def reject(reason: str, missing: list | None = None) -> dict:
+        report.update(valid=False, node_id=None, path=[], evidence=None, start=None, reasons=[reason])
+        if missing is not None:
+            report["missing"] = missing
+        return report
+
+    if authority.get("source") != "current_photo":
+        return reject("current_verified_photo_required")
+    if not report["reasons"] or report["reasons"][0] != "start_not_connected":
+        return report
+    if not isinstance(imported, dict):
+        return reject("invalid_import_document")
+    full = "source" in imported
+    attachment = imported.get("attachment") if (full or "attachment" in imported) else imported
+    if not isinstance(attachment, dict):
+        return reject("attachment_required", ["attachment"])
+    # A wrapper is not allowed to smuggle conflicting start fields.
+    if not full and "attachment" in imported and set(imported) - {"attachment", "schema_version"}:
+        return reject("ambiguous_import_document")
+    documents = [attachment] + ([imported] if full else [])
+    for document in documents:
+        for field in PHOTO_BINDING:
+            if field not in document:
+                return reject("import_binding_missing", [field])
+            if document[field] != authority[field]:
+                return reject("import_" + field + "_mismatch", [])
+    if full:
+        for field in ("source", "pose_status", "quality"):
+            if imported.get(field) != authority.get(field):
+                return reject("import_" + field + "_mismatch", [])
+    pose_documents = ([imported] if full else [])
+    if not full or "T_MC" in attachment or "T_WC_query" in attachment:
+        pose_documents.append(attachment)
+    for document in pose_documents:
+        if "T_MC" not in document and "T_WC_query" not in document:
+            return reject("import_pose_required", ["T_MC"])
+        try:
+            if not np.allclose(_camera_pose(document), _camera_pose(authority), atol=POSE_ATOL, rtol=0):
+                return reject("import_pose_mismatch", [])
+        except ValueError:
+            return reject("invalid_import_pose", [])
+    proposed = deepcopy(authority)
+    proposed["attachment"] = deepcopy(attachment)
+    report = validate_start_connection(graph, proposed, **options)
+    report["start"] = proposed if report["valid"] else None
+    return report
 
 
 def _dijkstra(graph: dict, start: str, disabled: set[str]) -> tuple[dict, dict]:
@@ -353,7 +554,8 @@ def _dijkstra(graph: dict, start: str, disabled: set[str]) -> tuple[dict, dict]:
 
 def plan_route(graph: dict, start: dict, target: dict, *, now: str,
                max_start_age_s: float = 30.0, disabled_edge_ids: tuple | list = (),
-               T_BC: Any = None) -> dict:
+               T_BC: Any = None, time_mode: str = "live_current",
+               replay_reference_time: str | None = None) -> dict:
     """Dijkstra preview to an actually supported reference observation camera.
 
     `now` must be a timezone-aware ISO time, supplied explicitly for purity.
@@ -361,7 +563,7 @@ def plan_route(graph: dict, start: dict, target: dict, *, now: str,
     T_BC requests metric start-body conversion; the route remains camera-only.
     Missing connectivity never produces a straight-line fallback.
     """
-    now_value = _time(now)
+    now_value, reference_time = _time_context(now, time_mode, replay_reference_time)
     max_age = _number(max_start_age_s)
     if max_age < 0:
         raise ValueError("invalid_max_start_age_s")
@@ -370,7 +572,8 @@ def plan_route(graph: dict, start: dict, target: dict, *, now: str,
         **{key: graph.get(key) for key in IDENTITY},
         "start_source": start.get("source"),
         "start_times": {key: start.get(key) for key in ("captured_at", "localized_at", "selected_at")},
-        "planned_at": now, "max_start_age_s": max_age,
+        "planned_at": now, "run_at": now, "max_start_age_s": max_age,
+        "time_mode": time_mode, "replay_reference_time": replay_reference_time,
         "start_quality": deepcopy(start.get("quality")),
         "start_camera_pose": None, "start_base_pose": None,
         "target_object_result": deepcopy(target), "goal_observation_pose": None,
@@ -394,8 +597,7 @@ def plan_route(graph: dict, start: dict, target: dict, *, now: str,
         result["failure_reason"] = reason
         return result
 
-    if (graph.get("schema_version") != "go1loc.route_graph.v1"
-            or graph.get("graph_sha256") != _digest({k: v for k, v in graph.items() if k != "graph_sha256"})):
+    if not _valid_graph(graph):
         return reject("invalid_graph")
     for value in (start, target):
         reason = _identity_failure(value, graph)
@@ -409,7 +611,8 @@ def plan_route(graph: dict, start: dict, target: dict, *, now: str,
     goals = sorted(set(support) & graph["nodes"].keys())
     if not goals:
         return reject("goal_not_supported")
-    node, prefix, evidence, camera, reason = _start_connection(graph, start, target, now_value, max_age)
+    node, prefix, evidence, camera, reason = _start_connection(
+        graph, start, target, now_value, max_age, reference_time)
     result["start_camera_pose"] = deepcopy(camera)
     if reason:
         return reject(reason)

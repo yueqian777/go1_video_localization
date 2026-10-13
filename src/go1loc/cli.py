@@ -72,6 +72,10 @@ def main(argv=None) -> int:
     view.add_argument('--query-dir')
     view.add_argument('--snapshots')
     view.add_argument('--legacy', action='store_true', help='Static JSON debug view, not 3D')
+    watch = sub.add_parser('watch-build', help='Monitor an active build run before the first frozen map exists')
+    watch.add_argument('--run', required=True, help='Run directory containing atomic run metadata')
+    watch.add_argument('--sidecar', required=True, help='Viewer output separate from build run and map')
+    watch.add_argument('--port', type=int, default=8766)
     graph = sub.add_parser('build-route-graph')
     graph.add_argument('--map', required=True)
     graph.add_argument('--frames-manifest')
@@ -87,6 +91,8 @@ def main(argv=None) -> int:
     plan.add_argument('--max-start-age-s', type=float, default=30.)
     plan.add_argument('--disable-edge', action='append', default=[])
     plan.add_argument('--extrinsics', help='Metric T_BC JSON; arbitrary scale rejects it')
+    plan.add_argument('--time-mode', choices=['live_current', 'offline_replay'], default='live_current')
+    plan.add_argument('--replay-reference-time', help='Historical replay time; never replaces actual runtime or capture time')
     evaluation = sub.add_parser("evaluate")
     evaluation.add_argument("--results", required=True)
     evaluation.add_argument("--output", required=True)
@@ -144,6 +150,10 @@ def main(argv=None) -> int:
         _path(args.output).write_text(json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8")
         print(json.dumps(payload, indent=2, ensure_ascii=False))
         return 0 if support.status == "supported" else 2
+    if args.command == 'watch-build':
+        from .build_viewer import watch_build
+        watch_build(_path(args.run), _path(args.sidecar), port=args.port)
+        return 0
     if args.command == "view":
         root = _path(args.root).resolve()
         sidecar = _path(args.sidecar).resolve() if args.sidecar else root.with_name(root.name+'.viewer')
@@ -189,6 +199,7 @@ def main(argv=None) -> int:
                 _reject_frozen_destination(destination)
                 payload=plan_route(_read_json(args.graph),_read_json(args.start),_read_json(args.target),
                     now=datetime.now(timezone.utc).isoformat(),max_start_age_s=args.max_start_age_s,
+                    time_mode=args.time_mode, replay_reference_time=args.replay_reference_time,
                     disabled_edge_ids=args.disable_edge,T_BC=_read_json(args.extrinsics) if args.extrinsics else None)
             write_json(destination,payload)
         except (OSError, ValueError, KeyError) as exc:

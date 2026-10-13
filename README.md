@@ -12,7 +12,10 @@
 - `go1loc locate-photo-object`：照片＋地图＋原图 ROI/掩膜，实际计算并验证 PnP 支持，输出可见表面范围。
 - `go1loc view`：可选 Viser 三维界面，仅监听 `127.0.0.1`；独立工作进程处理定位，结果写 sidecar。
 - `go1loc build-map --snapshot-frames-freq 8`：记录真实 PyCOLMAP 中间快照；与最终地图回放严格区分。
+- `go1loc watch-build --run ... --sidecar ...`：首次建图尚无冻结地图时观看阶段与 READY 快照，支持自动跟随、暂停/历史回看和完成切换。
+- `view` 新增历史路段候选生成、人工拆分/确认/拒绝、当前照片接入证据检查与明确采用流程，不必编辑内部 JSON。
 - `go1loc build-route-graph` / `plan-route`：只沿有连续时间证据的历史路线作有向 Dijkstra 预览，不连接机器狗。
+- `plan-route --time-mode offline_replay --replay-reference-time ...`：明确分离真实采集/计算时间和回放参照时间；仍不可执行运动。
 - `go1loc doctor`：只读检查本机工具、Python 包、GPU 和固定上游版本。
 - `go1loc evaluate`：保留所有查询（包括失败和拒绝）并汇总状态。
 
@@ -48,6 +51,8 @@
 公开 South-Building 实测已在 `results/public_south_map40_lg_k2048` 生成冻结地图：40/40 图像注册、10,394 个 3D 点、平均重投影误差 1.316 px。地图内查询 `P1180170.JPG` 通过定位质量门禁；未参与建图的 `P1180181.JPG` 和 `P1180182.JPG` 被严格拒绝，分别记录 0.2096 和 0.1381 的内点率。该结果只证明公开建筑样例上的软件链路，不等同于 Go1 相机或点云质量验收。
 
 2026-10-13 增量版本的运行方法、数据关联、安全边界和实测证据见 [离线工作流](docs/OFFLINE_WORKFLOW_zh.md)、[验收记录](docs/INCREMENT_VALIDATION_20261013.md) 和 [规划合同](docs/PLANNING_CONTRACT.md)。原始地图和上述历史结果保留不变。
+
+基于 `15ff93c` 的后续修订见 [首次建图与路线输入操作说明](docs/BUILD_WATCH_ROUTE_WORKFLOW_zh.md)、[本轮验证记录](docs/INCREMENT2_VALIDATION_20261013.md) 和 [审核/回放接口契约](docs/REVIEW_TIME_CONTRACT.md)。该修订修复查询切换后的旧对象/路线残留，已实测首次建图时自动加载7份真实快照；这里的建图来源仍是公开无序照片，不是连续运动视频。用户确认当前没有真实视频/独立照片/标定输入，所以真实连续视频 A/B 路线验收明确阻塞，不能以软件回归或合成夹具替代。
 
 ## 研究边界
 
