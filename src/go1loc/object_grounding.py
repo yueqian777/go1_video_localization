@@ -63,6 +63,8 @@ def support_from_roi_matches(
 ) -> ObjectSupport:
     if not _valid_roi(roi):
         return ObjectSupport("invalid_input", failure_reason="invalid_roi")
+    if min_points < 1 or not np.isfinite(cluster_radius) or cluster_radius <= 0:
+        return ObjectSupport("invalid_input", failure_reason="invalid_clustering_parameters")
     x0, y0, x1, y1 = roi
     unique: dict[int, dict[str, Any]] = {}
     for observation in observations:
@@ -73,6 +75,9 @@ def support_from_roi_matches(
         except (KeyError, TypeError, ValueError):
             continue
         if x0 <= u <= x1 and y0 <= v <= y1 and point_id in points3d:
+            point = np.asarray(points3d[point_id], dtype=float)
+            if point.shape != (3,) or not np.isfinite(point).all():
+                continue
             unique.setdefault(point_id, {"frame_ids": set()})["frame_ids"].add(frame_id)
     if len(unique) < min_points:
         return ObjectSupport("insufficient_evidence", failure_reason="insufficient_roi_3d_support")
@@ -84,7 +89,9 @@ def support_from_roi_matches(
         _candidate([ids[i] for i in group], [f for i in group for f in unique[ids[i]]["frame_ids"]], xyz[group])
         for group in groups
     ]
-    if len(candidates) != 1:
+    if not candidates:
+        return ObjectSupport("insufficient_evidence", failure_reason="insufficient_cluster_support")
+    if len(candidates) > 1:
         return ObjectSupport("ambiguous", candidates=candidates, failure_reason="multiple_spatial_support_clusters")
 
     selected = candidates[0]

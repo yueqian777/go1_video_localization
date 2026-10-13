@@ -42,6 +42,11 @@ class LocalizationResult:
     failure_reason: str | None = None
     timing: dict[str, float] = field(default_factory=dict)
     nav_goal: None = None
+    map_hash: str | None = None
+    query_sha256: str | None = None
+    capture_time: str | None = None
+    localization_time: str | None = None
+    evidence_path: str | None = None
 
     @classmethod
     def failure(cls, *, query_id: str, map_id: str, reason: str, mode: str = "photo"):

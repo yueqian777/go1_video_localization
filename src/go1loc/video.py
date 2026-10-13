@@ -9,11 +9,15 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import shutil
 import subprocess
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any
+from uuid import uuid4
+
+from .events import BoundedEventWriter, outside_artifacts
 
 
 class VideoPipelineError(RuntimeError):
@@ -170,6 +174,8 @@ def select_frame_records(frames: list[dict], config: FrameConfig) -> list[dict]:
         if raw_time is None:
             raise VideoPipelineError('missing_frame_pts')
         t = float(raw_time)
+        if not math.isfinite(t):
+            raise VideoPipelineError('non_finite_frame_pts')
         if previous is not None and t <= previous:
             raise VideoPipelineError('non_monotonic_or_duplicate_pts')
         previous = t
@@ -202,7 +208,23 @@ def frame_quality(image, config: FrameConfig, previous=None) -> dict:
     return {'laplacian_variance':blur,'overexposure_fraction':over,'mean_change_64px':diff,'rejection_reasons':reasons}
 
 
-def prepare_video(path: Path, output_dir: Path, config: FrameConfig | None = None, calibration_path: Path | None = None) -> dict:
+def prepare_video(path: Path, output_dir: Path, config: FrameConfig | None = None,
+                  calibration_path: Path | None = None, *, events: BoundedEventWriter | None = None) -> dict:
+    """Prepare frames; emit events outside the immutable cached frame directory."""
+    output_dir = output_dir.resolve()
+    if events:
+        outside_artifacts(events.path, output_dir)
+    else:
+        sidecar = output_dir.with_name(output_dir.name + '.sidecar') / uuid4().hex
+        events = BoundedEventWriter(sidecar / 'events.jsonl')
+    with events.stage('video'):
+        result = _prepare_video(path, output_dir, config, calibration_path, events)
+    events.emit('final', stage='video', data={'frames_manifest': str(output_dir / 'frames_manifest.json'),
+                'candidate_count': result['candidate_count'], 'kept_count': result['kept_count']})
+    return result
+
+
+def _prepare_video(path, output_dir, config, calibration_path, events) -> dict:
     """Bounded decode using real presentation times, followed by auditable filtering.
 
     Decoding always starts at stream origin. frame_index is the decoded display
@@ -212,7 +234,8 @@ def prepare_video(path: Path, output_dir: Path, config: FrameConfig | None = Non
     import numpy as np
     from .calibration import load_calibration, build_rectification
     config = config or FrameConfig()
-    probe = probe_video(path)
+    with events.stage('video_probe'):
+        probe = probe_video(path)
     # Validate budget even if the clip has no frames.
     select_frame_records([],config)
     signature = {'video_sha256':probe.source_sha256,'config':asdict(config),'calibration_sha256':sha256_file(calibration_path) if calibration_path else None}
@@ -223,6 +246,8 @@ def prepare_video(path: Path, output_dir: Path, config: FrameConfig | None = Non
         if saved.get('signature')!=signature:
             raise VideoPipelineError('output_cache_signature_mismatch_use_new_directory')
         if all((output_dir/r['image_path']).exists() for r in saved['frames'] if r['kept']):
+            events.emit('cache_hit', stage='video', data={'source': str(manifest_file),
+                        'note': 'no_new_decode_or_frame_events'})
             return saved
         raise VideoPipelineError('cached_frames_missing_use_new_directory')
     if output_dir.exists() and any(output_dir.iterdir()):
@@ -238,9 +263,10 @@ def prepare_video(path: Path, output_dir: Path, config: FrameConfig | None = Non
         raise VideoPipelineError('no_frames_in_requested_time_window')
     filt = 'select='+ '+'.join(f'eq(n\\,{r["frame_index"]})' for r in selected)
     command = [shutil.which('ffmpeg') or 'ffmpeg','-v','error','-nostdin','-noautorotate','-i',str(path.resolve()),'-map','0:v:0','-t',str(config.start_s+config.duration_s),'-vf',filt,'-fps_mode','vfr','-frames:v',str(len(selected)),str(output_dir/'raw'/'%06d.png')]
-    decoded = subprocess.run(command,capture_output=True,text=True,encoding='utf-8',timeout=600)
-    if decoded.returncode:
-        raise VideoPipelineError('decode_failed:'+decoded.stderr[-500:])
+    with events.stage('video_decode'):
+        decoded = subprocess.run(command,capture_output=True,text=True,encoding='utf-8',timeout=600)
+        if decoded.returncode:
+            raise VideoPipelineError('decode_failed:'+decoded.stderr[-500:])
     files = sorted((output_dir/'raw').glob('*.png'))
     if len(files)!=len(selected):
         raise VideoPipelineError('decoded_frame_count_does_not_match_pts')
@@ -258,6 +284,7 @@ def prepare_video(path: Path, output_dir: Path, config: FrameConfig | None = Non
         geometry.update({'status':'calibrated_rectified','calibration':cal.to_dict(),'crop_xywh':rect['crop_xywh'],'output_K':rect['output_K'].tolist(),'nonlinear_mapping':'rectification_maps.npz','valid_mask':'valid_mask.png'})
     prior = None
     last_kept = None
+    events.emit('started', stage='frame_filter')
     for row,file in zip(selected,files):
         img = cv2.imdecode(np.fromfile(str(file),dtype=np.uint8),cv2.IMREAD_COLOR)
         if rect:
@@ -279,6 +306,13 @@ def prepare_video(path: Path, output_dir: Path, config: FrameConfig | None = Non
             row['image_path'] = dest.relative_to(output_dir).as_posix()
             prior = cv2.resize(cv2.cvtColor(img,cv2.COLOR_BGR2GRAY),(64,64)).astype(float)
             last_kept = row['relative_time_s']
+        events.emit('frame_kept' if row['kept'] else 'frame_rejected', stage='frame_filter',
+                    video_pts_s=row['pts_time_s'], data={'frame_index': row['frame_index'],
+                    'pts': row['pts'], 'relative_time_s': row['relative_time_s'],
+                    'image_path': row['image_path'], 'quality': quality,
+                    'source_video_sha256': probe.source_sha256, 'exposure_time': None})
+    events.emit('completed', stage='frame_filter', data={'candidate_count': len(selected),
+                'kept_count': sum(r['kept'] for r in selected)})
     result = {'schema_version':'go1loc.frames.v1','signature':signature,'probe':probe.to_dict(),'geometry':geometry,'frames':selected,'candidate_count':len(selected),'kept_count':sum(r['kept'] for r in selected),'timing_source':'best_effort_pts_not_exposure_time','robot_access':False}
     manifest_file.write_text(json.dumps(result,ensure_ascii=False,indent=2),encoding='utf-8')
     return result

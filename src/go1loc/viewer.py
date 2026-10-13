@@ -26,12 +26,15 @@ canvas.onmousemove=e=>{if(!start)return;const r=canvas.getBoundingClientRect();c
 canvas.onmouseup=()=>{if(!start||!current)return;const roi=[Math.min(start[0],current[0]),Math.min(start[1],current[1]),Math.max(start[0],current[0]),Math.max(start[1],current[1])];document.getElementById('roi').textContent=JSON.stringify({query_id:imageName,roi},null,2);const blob=new Blob([JSON.stringify({query_id:imageName,roi},null,2)],{type:'application/json'});document.getElementById('download').disabled=false;document.getElementById('download').onclick=()=>{const a=document.createElement('a');a.href=URL.createObjectURL(blob);a.download='roi.json';a.click()};start=null};
 fetch('viewer_payload.json').then(r=>r.json()).then(data=>{
   const app=document.getElementById('app');
-  app.innerHTML='<h2>Status: '+data.result.pose_status+'</h2><pre>'+JSON.stringify(data,null,2)+'</pre>';
+  const h=document.createElement('h2');h.textContent='Status: '+(data.result.pose_status||'unknown');
+  const pre=document.createElement('pre');pre.textContent=JSON.stringify(data,null,2);app.replaceChildren(h,pre);
 }).catch(e=>document.getElementById('app').textContent='No viewer_payload.json: '+e);
 </script>"""
 
 
 def prepare_viewer(root: Path, result: dict | None = None, manifest: dict | None = None) -> Path:
+    if (root/'map_manifest.json').exists() or any((p/'map_manifest.json').exists() for p in root.resolve().parents):
+        raise ValueError('viewer_output_overlaps_frozen_map')
     root.mkdir(parents=True, exist_ok=True)
     (root / "index.html").write_text(HTML, encoding="utf-8")
     payload = {"result": result or {}, "map": manifest or {}}

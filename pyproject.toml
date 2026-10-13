@@ -24,6 +24,7 @@ vision = [
   "pycolmap>=3.13",
 ]
 test = ["coverage>=7.0"]
+viewer = ["viser==1.1.1", "pillow>=10"]
 
 [project.scripts]
 go1loc = "go1loc.cli:main"

@@ -11,9 +11,16 @@ if (-not (Test-Path -LiteralPath $hloc)) { throw "Missing pinned hloc checkout: 
 if (-not (Test-Path -LiteralPath $lightGlue)) { throw "Missing pinned LightGlue checkout: $lightGlue" }
 
 $env:PIP_CACHE_DIR = $cache
+$env:TEMP = Join-Path $projectRoot '.cache\install-temp'
+$env:TMP = $env:TEMP
+New-Item -ItemType Directory -Path $env:TEMP -Force | Out-Null
 & $python -m pip install --disable-pip-version-check --no-warn-script-location --cache-dir $cache -r (Join-Path $projectRoot 'requirements-pipeline.txt')
+if ($LASTEXITCODE -ne 0) { throw "Pipeline dependency installation failed" }
 & $python -m pip install --disable-pip-version-check --no-warn-script-location --cache-dir $cache --no-deps -e $lightGlue
+if ($LASTEXITCODE -ne 0) { throw "LightGlue installation failed" }
 & $python -m pip install --disable-pip-version-check --no-warn-script-location --cache-dir $cache --no-deps -e $hloc
+if ($LASTEXITCODE -ne 0) { throw "hloc installation failed" }
 & $python -m pip check
+if ($LASTEXITCODE -ne 0) { throw "Dependency consistency check failed" }
 
 Write-Output 'Pipeline dependencies installed from the pinned D-drive upstream checkouts.'

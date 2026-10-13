@@ -36,10 +36,30 @@ def main(argv=None) -> int:
     mapping.add_argument("--output", required=True)
     mapping.add_argument("--map-id", default="go1-map")
     mapping.add_argument("--max-keypoints", type=int, default=4096)
+    mapping.add_argument('--snapshot-frames-freq', type=int, default=0)
+    mapping.add_argument('--snapshot-max-count', type=int, default=20)
+    mapping.add_argument('--sidecar')
     localize = sub.add_parser("localize-photo")
     localize.add_argument("--photo", required=True)
     localize.add_argument("--map", required=True)
     localize.add_argument("--output", required=True)
+    localize.add_argument('--camera-model')
+    localize.add_argument('--camera-params', nargs='+', type=float)
+    localize.add_argument('--calibration')
+    localize.add_argument('--capture-time', help='Actual capture time in ISO8601, not file mtime')
+    photo_object = sub.add_parser('locate-photo-object')
+    photo_object.add_argument('--photo', required=True)
+    photo_object.add_argument('--map', required=True)
+    photo_object.add_argument('--output', required=True)
+    photo_object.add_argument('--roi', required=True, nargs=4, type=float)
+    photo_object.add_argument('--mask')
+    photo_object.add_argument('--query-dir', help='Reuse only hash-verified saved query evidence')
+    photo_object.add_argument('--cluster-radius', type=float, help='Explicit radius in map units; default scale-adaptive')
+    photo_object.add_argument('--min-points', type=int, default=3)
+    photo_object.add_argument('--camera-model')
+    photo_object.add_argument('--camera-params', nargs='+', type=float)
+    photo_object.add_argument('--calibration')
+    photo_object.add_argument('--capture-time')
     obj = sub.add_parser("locate-object")
     obj.add_argument("--observations", required=True, help="JSON list of ROI-to-3D observations")
     obj.add_argument("--points3d", required=True, help="JSON object mapping point3D_id to [x,y,z]")
@@ -48,6 +68,25 @@ def main(argv=None) -> int:
     view = sub.add_parser("view")
     view.add_argument("--root", required=True)
     view.add_argument("--port", type=int, default=8765)
+    view.add_argument('--sidecar', help='Output outside the frozen map; required for Viser')
+    view.add_argument('--query-dir')
+    view.add_argument('--snapshots')
+    view.add_argument('--legacy', action='store_true', help='Static JSON debug view, not 3D')
+    graph = sub.add_parser('build-route-graph')
+    graph.add_argument('--map', required=True)
+    graph.add_argument('--frames-manifest')
+    graph.add_argument('--segments', help='Verified continuous segments JSON; no inferred proximity edges')
+    graph.add_argument('--component')
+    graph.add_argument('--max-gap-s', type=float, default=2.)
+    graph.add_argument('--output', required=True)
+    plan = sub.add_parser('plan-route')
+    plan.add_argument('--graph', required=True)
+    plan.add_argument('--start', required=True, help='Explicit manual/current_photo start JSON')
+    plan.add_argument('--target', required=True, help='Supported object_result.json')
+    plan.add_argument('--output', required=True)
+    plan.add_argument('--max-start-age-s', type=float, default=30.)
+    plan.add_argument('--disable-edge', action='append', default=[])
+    plan.add_argument('--extrinsics', help='Metric T_BC JSON; arbitrary scale rejects it')
     evaluation = sub.add_parser("evaluate")
     evaluation.add_argument("--results", required=True)
     evaluation.add_argument("--output", required=True)
@@ -68,7 +107,9 @@ def main(argv=None) -> int:
             return 2
     if args.command == "build-map":
         try:
-            manifest = build_map(_path(args.images), _path(args.output), MappingConfig(map_id=args.map_id, max_keypoints=args.max_keypoints))
+            manifest = build_map(_path(args.images), _path(args.output), MappingConfig(map_id=args.map_id,
+                max_keypoints=args.max_keypoints, snapshot_frames_freq=args.snapshot_frames_freq,
+                snapshot_max_count=args.snapshot_max_count, sidecar_dir=args.sidecar))
             print(json.dumps(manifest, indent=2, ensure_ascii=False))
             return 0
         except (PipelineInputError, PipelineUnavailable, OSError, ValueError, RuntimeError) as exc:
@@ -76,13 +117,24 @@ def main(argv=None) -> int:
             return 2
     if args.command == "localize-photo":
         try:
-            result = localize_photo(_path(args.photo), _path(args.map), _path(args.output), LocalizationConfig())
+            result = localize_photo(_path(args.photo), _path(args.map), _path(args.output), _query_config(args))
         except (PipelineInputError, PipelineUnavailable, OSError, ValueError, KeyError) as exc:
             result = LocalizationResult.failure(query_id=_path(args.photo).name, map_id=_path(args.map).name, reason="pipeline_error_" + str(exc))
-            _path(args.output).mkdir(parents=True, exist_ok=True)
-            (_path(args.output) / "localization_result.json").write_text(json.dumps(result.to_dict(), indent=2, ensure_ascii=False), encoding="utf-8")
+            # Validation may reject an output inside a frozen map or an existing run.
+            # Never write there from the error handler.
         print(json.dumps(result.to_dict(), indent=2, ensure_ascii=False))
         return 0 if result.pose_status == "localized" else 2
+    if args.command == 'locate-photo-object':
+        from .photo_object import locate_photo_object
+        try:
+            payload = locate_photo_object(_path(args.photo), _path(args.map), _path(args.output), args.roi,
+                mask_path=_path(args.mask) if args.mask else None,
+                query_dir=_path(args.query_dir) if args.query_dir else None,
+                cluster_radius=args.cluster_radius, min_points=args.min_points, config=_query_config(args))
+        except (PipelineInputError, PipelineUnavailable, OSError, ValueError, KeyError) as exc:
+            payload = {'status': 'pipeline_error', 'failure_reason': str(exc), 'execution_permitted': False}
+        print(json.dumps(payload, indent=2, ensure_ascii=False))
+        return 0 if payload['status'] == 'supported' else 2
     if args.command == "locate-object":
         observations = json.loads(_path(args.observations).read_text(encoding="utf-8"))
         points_raw = json.loads(_path(args.points3d).read_text(encoding="utf-8"))
@@ -93,17 +145,78 @@ def main(argv=None) -> int:
         print(json.dumps(payload, indent=2, ensure_ascii=False))
         return 0 if support.status == "supported" else 2
     if args.command == "view":
-        root = _path(args.root)
+        root = _path(args.root).resolve()
+        sidecar = _path(args.sidecar).resolve() if args.sidecar else root.with_name(root.name+'.viewer')
+        from .events import outside_artifacts
+        outside_artifacts(sidecar, root)
+        if not args.legacy:
+            from .viser_viewer import serve_viser
+            serve_viser(root, sidecar, port=args.port,
+                        query_dir=_path(args.query_dir) if args.query_dir else None,
+                        snapshot_dir=_path(args.snapshots) if args.snapshots else None)
+            return 0
         result_path = root / "localization_result.json"
         manifest_path = root / "map_manifest.json"
         result = json.loads(result_path.read_text(encoding="utf-8")) if result_path.exists() else {}
         manifest = json.loads(manifest_path.read_text(encoding="utf-8")) if manifest_path.exists() else {}
-        prepare_viewer(root, result, manifest)
-        serve(root, port=args.port)
+        prepare_viewer(sidecar, result, manifest)
+        serve(sidecar, port=args.port)
         return 0
+    if args.command in ('build-route-graph', 'plan-route'):
+        from datetime import datetime, timezone
+        from .planning import build_route_graph, plan_route
+        from .evidence import verify_map, write_json
+        try:
+            destination=_path(args.output).resolve()
+            if destination.exists():
+                raise ValueError('output_exists_use_new_path')
+            if args.command == 'build-route-graph':
+                from .events import outside_artifacts
+                from .evidence import resolve_map_path
+                map_dir=_path(args.map).resolve()
+                outside_artifacts(destination,map_dir)
+                manifest=verify_map(map_dir)
+                # Read native verified camera poses rather than trusting an unbound sidecar.
+                import pycolmap
+                model=pycolmap.Reconstruction(resolve_map_path(map_dir,manifest['model_dir']))
+                refs={im.name:{'image_id':int(im.image_id),'T_CW':im.cam_from_world().matrix().tolist()}
+                      for im in model.images.values()}
+                frames=_read_json(args.frames_manifest) if args.frames_manifest else manifest.get('frames_manifest')
+                payload=build_route_graph(manifest,refs,frames,component_id=args.component,
+                                         route_segments=_read_json(args.segments) if args.segments else None,
+                                         max_gap_s=args.max_gap_s)
+            else:
+                _reject_frozen_destination(destination)
+                payload=plan_route(_read_json(args.graph),_read_json(args.start),_read_json(args.target),
+                    now=datetime.now(timezone.utc).isoformat(),max_start_age_s=args.max_start_age_s,
+                    disabled_edge_ids=args.disable_edge,T_BC=_read_json(args.extrinsics) if args.extrinsics else None)
+            write_json(destination,payload)
+        except (OSError, ValueError, KeyError) as exc:
+            payload={'status':'rejected','failure_reason':str(exc),'execution_permitted':False}
+        print(json.dumps(payload,indent=2,ensure_ascii=False))
+        return 0 if payload.get('schema_version') == 'go1loc.route_graph.v1' or payload.get('status') == 'route_preview_only' else 2
     if args.command == "evaluate":
         report = evaluate_results(_path(args.results))
         _path(args.output).write_text(json.dumps(report, indent=2, ensure_ascii=False), encoding="utf-8")
         print(json.dumps(report, indent=2, ensure_ascii=False))
         return 0
     return 1
+
+
+def _query_config(args):
+    return LocalizationConfig(query_camera_model=args.camera_model, query_camera_params=args.camera_params,
+                              calibration_path=_path(args.calibration) if args.calibration else None,
+                              capture_time=args.capture_time)
+
+
+def _read_json(path):
+    return json.loads(_path(path).read_text(encoding='utf-8'))
+
+
+def _reject_frozen_destination(destination):
+    if any((p/'map_manifest.json').exists() for p in destination.parents):
+        raise ValueError('output_overlaps_frozen_map')
+
+
+if __name__ == '__main__':
+    raise SystemExit(main())

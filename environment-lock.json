@@ -3,6 +3,7 @@
   "host": "Windows 11, NVIDIA GeForce RTX 5070 Ti Laptop GPU 12GB, CUDA driver reported 13.3",
   "python": "3.12.10 portable runtime in runtime/python312 (D: drive)",
   "core_installed": {"numpy": "2.5.2"},
+  "optional_viewer": {"viser": "1.1.1", "websockets": "16.1.1", "msgspec": "0.22.0", "trimesh": "5.1.1", "imageio": "2.38.1"},
   "backend": {
     "hloc_commit": "c13273bd0ecc2917a35910fd843712a1c6243193",
     "lightglue_commit": "eb42fee2d71449efb0aa5c10549752b5d75384d8",

@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import os
 import shutil
 import tempfile
@@ -16,9 +17,12 @@ from copy import deepcopy
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any
+from uuid import uuid4
 
 from .dependencies import git_revision
+from .events import BoundedEventWriter, outside_artifacts
 from .pipeline_errors import PipelineInputError, PipelineUnavailable
+from .snapshots import SnapshotPublisher, run_incremental_mapping
 from .video import sha256_file
 
 
@@ -53,6 +57,10 @@ class MappingConfig:
     temporal_window: int = 5
     refine_calibration: bool = False
     max_keypoints: int = 4096
+    snapshot_frames_freq: int = 0
+    snapshot_max_count: int = 20
+    snapshot_max_bytes: int = 512 * 1024 * 1024
+    sidecar_dir: str | None = None
 
 
 def _effective_feature_conf(base_conf: dict[str, Any], max_keypoints: int) -> dict[str, Any]:
@@ -165,6 +173,7 @@ def _write_manifest(output_dir: Path, config: MappingConfig, image_dir: Path, mo
         "retrieval_features": str(retrieval_features.resolve()) if retrieval_features else None,
         "retrieval_mode": retrieval_mode,
         "local_features": str(local_features.resolve()),
+        "local_features_sha256": sha256_file(local_features),
         "components": component_records,
         "num_registered_images": int(model.num_reg_images()),
         "num_points3D": int(model.num_points3D()),
@@ -179,6 +188,14 @@ def _write_manifest(output_dir: Path, config: MappingConfig, image_dir: Path, mo
             "lightglue": git_revision(upstream_dir / "LightGlue"),
         },
     }
+    frame_manifest = image_dir.parent / 'frames_manifest.json'
+    if frame_manifest.exists():
+        frame_bytes = frame_manifest.read_bytes()
+        manifest['frames_manifest'] = json.loads(frame_bytes)
+        manifest['frames_manifest_sha256'] = hashlib.sha256(frame_bytes).hexdigest()
+    else:
+        manifest['frames_manifest'] = None
+        manifest['frames_manifest_sha256'] = None
     manifest["manifest_sha256"] = hashlib.sha256(
         json.dumps(manifest, sort_keys=True, ensure_ascii=False).encode("utf-8")
     ).hexdigest()
@@ -188,25 +205,118 @@ def _write_manifest(output_dir: Path, config: MappingConfig, image_dir: Path, mo
     return manifest
 
 
-def build_map(image_dir: Path, output_dir: Path, config: MappingConfig | None = None) -> dict[str, Any]:
-    config = config or MappingConfig()
+def _video_references(image_dir: Path, refs: list[str]) -> tuple[list[str], dict, dict | None]:
+    """Order only validated manifest frames by real PTS, never by filename/id."""
+    source = image_dir.parent / 'frames_manifest.json'
+    if not source.exists():
+        return refs, {}, None
+    data = json.loads(source.read_text(encoding='utf-8'))
+    times = {}
+    for row in data.get('frames', []):
+        if not row.get('kept'):
+            continue
+        path = (source.parent / row['image_path']).resolve()
+        if image_dir not in path.parents:
+            raise PipelineInputError('frame_manifest_image_outside_image_directory')
+        name = path.relative_to(image_dir).as_posix()
+        pts = row.get('pts_time_s')
+        if not isinstance(pts, (int, float)) or not math.isfinite(pts):
+            raise PipelineInputError('frame_manifest_missing_finite_pts')
+        if name in times:
+            raise PipelineInputError('frame_manifest_duplicate_image')
+        times[name] = {key: row.get(key) for key in ('pts', 'pts_time_s', 'relative_time_s', 'frame_index')}
+    if set(times) != set(refs) or len({row['pts_time_s'] for row in times.values()}) != len(times):
+        raise PipelineInputError('frame_manifest_images_or_pts_mismatch')
+    return sorted(refs, key=lambda name: times[name]['pts_time_s']), times, data
+
+
+def _reconstruct_with_snapshots(backend, sfm_dir, work_image_dir, pairs_path, local_path,
+                                match_path, refs, camera_mode, image_options, mapper_options,
+                                publisher, config, frame_times, events):
+    """Reuse pinned hloc imports/verification; only substitute its mapper driver."""
+    import pycolmap
+    sfm_dir.mkdir(parents=True, exist_ok=True)
+    database = sfm_dir / 'database.db'
+    pycolmap.logging.set_log_destination(pycolmap.logging.INFO, sfm_dir / 'colmap.LOG.')
+    with events.stage('sfm_import_and_verification'):
+        backend.create_empty_db(database)
+        backend.import_images(work_image_dir, database, camera_mode, refs, image_options or None)
+        image_ids = backend.get_image_ids(database)
+        with pycolmap.Database.open(database) as db:
+            backend.import_features(image_ids, db, local_path)
+            backend.import_matches(image_ids, db, pairs_path, match_path, None, False)
+        backend.estimation_and_geometric_verification(database, pairs_path, False)
+    options = {'num_threads': min(os.cpu_count() or 1, 16), **mapper_options}
+    models = run_incremental_mapping(database, work_image_dir, sfm_dir / 'models', options,
+                                     publisher, frames_freq=config.snapshot_frames_freq,
+                                     frame_times=frame_times)
+    if not models:
+        return None
+    largest = max(models, key=lambda key: models[key].num_reg_images())
+    # Preserve the other models separately, matching hloc's existing layout.
+    for path in (sfm_dir / 'models' / str(largest)).glob('*.bin'):
+        shutil.move(str(path), str(sfm_dir / path.name))
+    return models[largest]
+
+
+def build_map(image_dir: Path, output_dir: Path, config: MappingConfig | None = None,
+              *, events: BoundedEventWriter | None = None) -> dict[str, Any]:
+    """Build a new frozen map, with bounded diagnostics in an external sidecar.
+
+    Snapshots are opt-in (frames_freq=0 by default). An injected event writer
+    belongs to the caller and must also be outside map/image artifacts.
+    """
+    config = deepcopy(config or MappingConfig())
     image_dir = image_dir.resolve()
     output_dir = output_dir.resolve()
+    sidecar = outside_artifacts(Path(config.sidecar_dir) if config.sidecar_dir else
+                                output_dir.with_name(output_dir.name + '.sidecar'), image_dir, output_dir)
+    if config.snapshot_frames_freq < 0:
+        raise PipelineInputError('invalid_snapshot_frequency')
+    if not 1 <= config.snapshot_max_count <= 1000 or config.snapshot_max_bytes < 1:
+        raise PipelineInputError('invalid_snapshot_budget')
     if (output_dir/'map_manifest.json').exists():
         raise PipelineInputError('frozen_map_exists_use_new_output')
     if output_dir.exists() and any(output_dir.iterdir()):
         raise PipelineInputError('map_output_not_empty_use_new_output')
     if image_dir==output_dir or image_dir in output_dir.parents:
         raise PipelineInputError('map_output_inside_image_directory')
+    if events:
+        outside_artifacts(events.path, image_dir, output_dir)
+        if events.map_id is not None and events.map_id != config.map_id:
+            raise PipelineInputError('event_map_id_mismatch')
+        events.map_id = config.map_id
+    run_dir = sidecar / (events.run_id if events else uuid4().hex)
+    # Never use caller-supplied run_id as a filesystem path.
+    if run_dir.parent != sidecar or run_dir.name in {'.', '..'}:
+        raise PipelineInputError('invalid_event_run_id')
+    run_dir.mkdir(parents=True, exist_ok=False)
+    events = events or BoundedEventWriter(run_dir / 'events.jsonl', run_id=run_dir.name, map_id=config.map_id)
+    stage_dir = None
+    with events.stage('mapping'):
+        try:
+            refs = _images(image_dir)
+            if len(refs) < 2:
+                raise PipelineInputError('mapping_requires_at_least_two_images')
+            refs, frame_times, frame_data = _video_references(image_dir, refs)
+            stage_dir = _ascii_stage(image_dir, refs)
+            manifest = _build_map(image_dir, output_dir, config, refs, frame_times, frame_data,
+                                  stage_dir or image_dir, run_dir, events)
+        finally:
+            if stage_dir:
+                shutil.rmtree(stage_dir, ignore_errors=True)
+    events.emit('final', stage='mapping', registered_images=manifest.get('num_registered_images'),
+                points3D=manifest.get('num_points3D'), data={'map_manifest': str(output_dir / 'map_manifest.json'),
+                'mode': 'final_map', 'sidecar_dir': str(run_dir),
+                'build_snapshots_available': bool(manifest.get('timing_s', {}).get('snapshot_count', 0))})
+    return manifest
+
+
+def _build_map(image_dir, output_dir, config, refs, frame_times, frame_data, work_image_dir, run_dir, events):
     project_root = Path(__file__).resolve().parents[2]
     os.environ.setdefault("TORCH_HOME", str(project_root / ".models" / "torch"))
-    refs = _images(image_dir)
-    if len(refs) < 2:
-        raise PipelineInputError("mapping_requires_at_least_two_images")
     pycolmap, extract_features, match_features, pairs_from_exhaustive, pairs_from_retrieval, reconstruction = _require_backend()
     output_dir.mkdir(parents=True, exist_ok=True)
-    stage_dir = _ascii_stage(image_dir, refs)
-    work_image_dir = stage_dir or image_dir
     started = time.perf_counter()
     timings: dict[str, float] = {}
     feature_conf = _effective_feature_conf(extract_features.confs[config.local_features], config.max_keypoints)
@@ -217,35 +327,41 @@ def build_map(image_dir: Path, output_dir: Path, config: MappingConfig | None = 
     pairs_path = output_dir / "pairs-mapping.txt"
 
     retrieval_mode = "exhaustive"
-    frame_manifest = image_dir.parent/'frames_manifest.json'
-    if frame_manifest.exists():
-        frame_data = json.loads(frame_manifest.read_text(encoding='utf-8'))
+    if frame_data is not None:
         geom = frame_data['geometry']
         if geom['status']=='calibrated_rectified' and not config.calibrated_camera_model:
             K=geom['output_K']
             config.calibrated_camera_model='PINHOLE'
             config.calibrated_camera_params=[K[0][0],K[1][1],K[0][2],K[1][2]]
         config.camera_mode='SINGLE'
-        retrieval_mode = "temporal_plus_exhaustive" if len(refs) <= config.exhaustive_limit else "netvlad_plus_temporal"
+        retrieval_mode = "temporal_window" if len(refs) <= config.exhaustive_limit else "netvlad_plus_temporal"
     if len(refs) > config.exhaustive_limit:
         retrieval_conf = extract_features.confs[config.retrieval]
         global_path = output_dir / f"{retrieval_conf['output']}.h5"
-        extract_features.main(retrieval_conf, work_image_dir, output_dir, image_list=refs, feature_path=global_path)
+        with events.stage('global_features'):
+            extract_features.main(retrieval_conf, work_image_dir, output_dir, image_list=refs, feature_path=global_path)
         timings["global_features"] = time.perf_counter() - started
-        retrieval_mode = "netvlad_plus_temporal" if frame_manifest.exists() else "netvlad"
-        if frame_manifest.exists():
+        retrieval_mode = "netvlad_plus_temporal" if frame_data is not None else "netvlad"
+        if frame_data is not None:
             pairs_from_retrieval.main(global_path, output_dir/'pairs-retrieval.txt', config.num_retrieved, query_list=refs, db_list=refs)
             pair_set = {tuple(sorted(pair)) for pair in temporal_pairs(refs,config.temporal_window)}
             pair_set.update(tuple(sorted(line.split())) for line in (output_dir/'pairs-retrieval.txt').read_text().splitlines() if line.strip())
             pairs_path.write_text(''.join(f'{a} {b}\n' for a,b in sorted(pair_set)),encoding='utf-8')
         else:
             pairs_from_retrieval.main(global_path, pairs_path, config.num_retrieved, query_list=refs, db_list=refs)
-    elif frame_manifest.exists():
+    elif frame_data is not None:
         pairs_path.write_text(''.join(f'{a} {b}\n' for a,b in temporal_pairs(refs,config.temporal_window)),encoding='utf-8')
     else:
         pairs_from_exhaustive.main(pairs_path, image_list=refs)
-    extract_features.main(feature_conf, work_image_dir, output_dir, image_list=refs, feature_path=local_path)
-    match_features.main(matcher_conf, pairs_path, features=local_path, matches=match_path)
+    with events.stage('local_features'):
+        extract_features.main(feature_conf, work_image_dir, output_dir, image_list=refs, feature_path=local_path)
+    with events.stage('matching'):
+        pair_count = sum(bool(line.strip()) for line in pairs_path.read_text(encoding='utf-8').splitlines())
+        events.emit('match_progress', stage='matching', data={'pairs_requested': pair_count,
+                    'completed': False, 'granularity': 'whole_batch_no_per_pair_callback'})
+        match_features.main(matcher_conf, pairs_path, features=local_path, matches=match_path)
+        events.emit('match_progress', stage='matching', data={'pairs_requested': pair_count,
+                    'completed': True, 'granularity': 'whole_batch_no_per_pair_callback'})
     timings["features_and_matches"] = time.perf_counter() - started
 
     sfm_dir = output_dir / "sfm"
@@ -254,21 +370,27 @@ def build_map(image_dir: Path, output_dir: Path, config: MappingConfig | None = 
         image_options["camera_model"] = config.calibrated_camera_model
         image_options["camera_params"] = ",".join(map(str, config.calibrated_camera_params or []))
     camera_mode = getattr(pycolmap.CameraMode, config.camera_mode)
-    model = reconstruction.main(
-        sfm_dir,
-        work_image_dir,
-        pairs_path,
-        local_path,
-        match_path,
-        image_list=refs,
-        camera_mode=camera_mode,
-        image_options=image_options or None,
-        mapper_options={'ba_refine_focal_length':not config.calibrated_camera_model or config.refine_calibration,'ba_refine_extra_params':not config.calibrated_camera_model or config.refine_calibration},
-    )
+    mapper_options = {'ba_refine_focal_length': not config.calibrated_camera_model or config.refine_calibration,
+                      'ba_refine_extra_params': not config.calibrated_camera_model or config.refine_calibration}
+    publisher = None
+    with events.stage('reconstruction'):
+        if config.snapshot_frames_freq:
+            publisher = SnapshotPublisher(run_dir / 'snapshots', events=events,
+                                          max_count=config.snapshot_max_count, max_bytes=config.snapshot_max_bytes)
+            model = _reconstruct_with_snapshots(reconstruction, sfm_dir, work_image_dir, pairs_path,
+                       local_path, match_path, refs, camera_mode, image_options, mapper_options,
+                       publisher, config, frame_times, events)
+        else:
+            model = reconstruction.main(sfm_dir, work_image_dir, pairs_path, local_path, match_path,
+                        image_list=refs, camera_mode=camera_mode, image_options=image_options or None,
+                        mapper_options=mapper_options)
     timings["reconstruction"] = time.perf_counter() - started
     if model is None or int(model.num_reg_images()) < 2 or int(model.num_points3D()) == 0:
         raise PipelineInputError("sfm_did_not_produce_a_3d_model")
+    timings['event_write_s'] = events.overhead_s
+    timings['snapshot_publish_s'] = publisher.overhead_s if publisher else 0.0
+    timings['snapshot_count'] = publisher.count if publisher else 0
+    # Native snapshot write duration is unavailable from the verified 4.2.1 API.
+    # This measures publication overhead only, not an invented total UI overhead.
     manifest = _write_manifest(output_dir, config, image_dir, model, refs, timings, global_path, local_path, retrieval_mode)
-    if stage_dir:
-        shutil.rmtree(stage_dir, ignore_errors=True)
     return manifest
