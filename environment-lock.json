@@ -1,0 +1,33 @@
+{
+  "created_on": "2026-10-13",
+  "host": "Windows 11, NVIDIA GeForce RTX 5070 Ti Laptop GPU 12GB, CUDA driver reported 13.3",
+  "python": "3.12.10 portable runtime in runtime/python312 (D: drive)",
+  "core_installed": {"numpy": "2.5.2"},
+  "backend": {
+    "hloc_commit": "c13273bd0ecc2917a35910fd843712a1c6243193",
+    "lightglue_commit": "eb42fee2d71449efb0aa5c10549752b5d75384d8",
+    "pycolmap": "4.2.1",
+    "torch": "2.9.0+cu130",
+    "torchvision": "0.24.0+cu130",
+    "cuda_runtime": "13.0 bundled with PyTorch",
+    "weights": {
+      "superpoint": "downloaded and used for 40-image public-sample extraction",
+      "lightglue": "47,500,279-byte public mirror file verified by SHA-256 and used for 40-image matching",
+      "netvlad": "not complete; large download stopped after unstable transfer"
+    },
+    "optional_pipeline_packages": "installed from pinned D-drive checkouts"
+  },
+  "install_policy": "On the validated Windows host, environments, wheels, caches, weights, and data live under the project directory on D:. If TORCH_HOME is unset, the pipeline defaults it to .models/torch under the project. An existing TORCH_HOME is respected. No robot or existing Go1 control files are modified.",
+  "public_sample_test": {
+    "dataset": "ETH/CVG South-Building",
+    "map_output": "results/public_south_map40_lg_k2048",
+    "registered_images": 40,
+    "points3D": 10394,
+    "mean_reprojection_error_px": 1.31635,
+    "in_map_query": "results/public_south_query_inmap_0170",
+    "held_out_queries": {
+      "P1180181.JPG": {"status": "rejected", "inlier_ratio": 0.20964432284541723},
+      "P1180182.JPG": {"status": "rejected", "inlier_ratio": 0.13806552262090482}
+    }
+  }
+}

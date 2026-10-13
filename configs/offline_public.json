@@ -1,0 +1,13 @@
+{
+  "project": "go1_video_localization",
+  "mapping": {
+    "retrieval": "netvlad",
+    "local_features": "superpoint_aachen",
+    "matcher": "superpoint+lightglue",
+    "num_retrieved": 20,
+    "exhaustive_limit": 80,
+    "camera_mode": "AUTO",
+    "map_id": "public-sample-unverified-go1"
+  },
+  "note": "This configuration does not claim Go1 calibration or Go1-video validity. Supply authenticated calibration before use with Go1 frames."
+}

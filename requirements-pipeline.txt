@@ -1,0 +1,16 @@
+opencv-python>=4.8
+pillow>=10
+pyyaml>=6
+h5py>=3.9
+scipy>=1.10
+tqdm>=4.36
+matplotlib>=3.7
+plotly>=5.0
+kornia>=0.6.11
+gdown>=4.7
+torch>=2.2
+torchvision>=0.17
+pycolmap>=3.13
+# hloc and LightGlue are installed from the pinned local checkouts under
+# .upstream by tools/install_pipeline.ps1.  Installing both Git URLs here
+# makes pip resolve hloc's own LightGlue URL twice on Windows.
