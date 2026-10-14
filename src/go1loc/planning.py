@@ -294,7 +294,30 @@ def _identity_failure(value: dict, graph: dict) -> str | None:
     return next((key + "_mismatch" for key in IDENTITY if value.get(key) != graph[key]), None)
 
 
-def _start_connection(graph: dict, start: dict, target: dict, now: datetime,
+def _original_photo_identity(value: dict, role: str) -> tuple[str | None, str | None]:
+    """Resolve existing RAW-image hash aliases, never a filename or path.
+
+    The caller must verify these against the original file/evidence first.
+    query_id is an hloc key or display basename, not observation identity.
+    Legacy ROI-only target identities remain usable when their binding was
+    verified; present malformed/conflicting aliases cannot be ignored.
+    """
+    hashes = [value[key] for key in ("photo_sha256", "query_sha256") if key in value]
+    if "roi_binding" in value:
+        binding = value["roi_binding"]
+        if not isinstance(binding, dict):
+            return None, role + "_photo_identity_invalid"
+        hashes.append(binding.get("query_sha256"))
+    if not hashes:
+        return None, role + "_photo_evidence_missing"
+    if any(not _sha256(digest) for digest in hashes):
+        return None, role + "_photo_identity_invalid"
+    if len(set(hashes)) != 1:
+        return None, role + "_photo_identity_conflict"
+    return hashes[0], None
+
+
+def _start_connection(graph: dict, start: dict, target: dict | None, now: datetime,
                       max_age: float, reference_time: datetime | None = None
                       ) -> tuple[str | None, list, dict | None, list | None, str | None]:
     """Return node, prefix path, provenance, camera pose, rejection reason."""
@@ -337,13 +360,17 @@ def _start_connection(graph: dict, start: dict, target: dict, now: datetime,
             or not _sha256(start.get("photo_sha256"))
             or not isinstance(start.get("quality"), dict) or not start["quality"]):
         return None, [], None, camera, "current_photo_evidence_missing"
-    roi_binding = target.get("roi_binding")
-    roi_query_hash = roi_binding.get("query_sha256") if isinstance(roi_binding, dict) else None
-    if (start["query_id"] == target.get("query_id")
-            or start["photo_sha256"] == target.get("query_sha256")
-            or start["photo_sha256"] == target.get("photo_sha256")
-            or start["photo_sha256"] == roi_query_hash):
-        return None, [], None, camera, "target_photo_is_not_current_pose"
+    original_hash, reason = _original_photo_identity(start, "current")
+    if reason:
+        return None, [], None, camera, reason
+    # Attachment-only inspection may omit a target. Planning always supplies it;
+    # absence of target identity in an actual target is NOT independence.
+    if target is not None:
+        target_hash, reason = _original_photo_identity(target, "target")
+        if reason:
+            return None, [], None, camera, reason
+        if original_hash == target_hash:
+            return None, [], None, camera, "target_photo_is_not_current_pose"
     connection = start.get("attachment", {})
     if not isinstance(connection, dict):
         return None, [], None, camera, "start_not_connected"
@@ -454,7 +481,7 @@ def validate_start_connection(graph: dict, start: dict, *, now: str,
         return result
     try:
         node, path, evidence, camera, reason = _start_connection(
-            graph, start, target or {}, runtime, age, reference)
+            graph, start, target, runtime, age, reference)
     except (TypeError, ValueError, KeyError, AttributeError):
         result["reasons"] = ["invalid_start_document"]
         return result

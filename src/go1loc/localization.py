@@ -115,6 +115,8 @@ def localize_photo(query_path: Path, map_dir: Path, output_dir: Path, config: Lo
     geometry['intrinsics_request'] = {'model': config.query_camera_model,
                                      'params': config.query_camera_params,
                                      'calibration_sha256': geometry.get('calibration_sha256')}
+    # hloc's per-workspace image key; rectified queries may all have this name.
+    # Original observation identity is binding['query_sha256'], not this key.
     query_name = query_copy.name
     from .mapping import _ascii_stage, _effective_feature_conf
     max_keypoints = int(manifest.get("config", {}).get("max_keypoints", 4096))
@@ -212,7 +214,7 @@ def localize_photo(query_path: Path, map_dir: Path, output_dir: Path, config: Lo
         binding = make_binding(query_path, manifest,
             {'query_features': local_query, 'matches': query_matches, 'reference_features': db_local,
              'processed_query': query_copy, 'calibration': config.calibration_path}, geometry)
-        result.query_sha256 = binding['query_sha256']
+        result.query_sha256 = binding['query_sha256']  # Original bytes, before rectification.
         result.evidence_path = str(output_dir/'query_evidence.json')
         evidence = {'schema_version': 'go1loc.evidence.v1', 'query_path': str(query_path),
                     'map_id': map_id, 'map_hash': result.map_hash, 'component_id': result.component_id,

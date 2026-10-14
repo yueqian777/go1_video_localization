@@ -78,6 +78,9 @@ import_current_start(current, imported, graph, *, now,
 调用方须先从现有哈希校验通过的当前照片定位结果创建 `current`，再读取外部文件为 `imported`。
 Viser 的保存结果导入器还要求新版 `localization_result_sha256`，将位姿、质量与时间绑定到证据。
 原图身份用原图哈希核验；标定后的 hloc 查询键按已绑定的处理图文件名核验，不能要求它等于原图文件名。
+跨目标/当前照片的独立性不按 `query_id` 或绝对路径判断：不同原图可有相同basename/处理键；同一原图改名、复制或内部去畸变仍是共同原始来源。
+规划要求已有 `query_sha256`、`photo_sha256`、`roi_binding.query_sha256`（按文档实际提供的字段）格式合法且一致；目标身份缺失、格式非法、别名冲突分别返回 `target_photo_evidence_missing`、`target_photo_identity_invalid`、`target_photo_identity_conflict`。当前别名冲突返回 `current_photo_identity_conflict`。原图相同仍返回 `target_photo_is_not_current_pose`。
+省略 `target` 的接入预检只核验接入，不代表目标独立性已通过；真正规划仍检查目标。此改动不更改既有导出格式，不迁移旧地图。详见[照片身份修复记录](IDENTITY_FIX_VALIDATION_20261014_zh.md)。
 导入格式有三种：完整 start、裸 attachment、仅包含 `attachment`（及可选 `schema_version`）的包装对象。
 完整 start 必须与当前已核验结果逐项一致：
 

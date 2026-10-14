@@ -109,6 +109,8 @@ def locate_photo_object(photo: Path, map_dir: Path, output_dir: Path, roi,
     payload = ground_evidence(evidence, roi, mask=mask, cluster_radius=cluster_radius, min_points=min_points)
     roi_binding = {'roi': list(roi), 'mask_sha256': sha256_file(Path(mask_path)) if mask_path else None,
                    'query_sha256': evidence['binding']['query_sha256'], 'evidence_sha256': evidence['evidence_sha256']}
+    # query_id here is a display basename, unlike localization's processed key.
+    # Both exports retain the SAME verified raw-image hash for identity checks.
     payload.update({'schema_version': 'go1loc.object.v1', 'query_path': str(photo),
                     'query_id': photo.name, 'query_sha256': evidence['binding']['query_sha256'],
                     'query_dir': str(query_dir), 'roi_binding': roi_binding, 'roi_sha256': digest_json(roi_binding),

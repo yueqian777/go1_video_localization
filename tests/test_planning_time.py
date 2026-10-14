@@ -1,10 +1,18 @@
 """Synthetic contract tests; no video/robot acceptance is implied."""
 from copy import deepcopy
+import json
+from pathlib import Path
+import shutil
+import tempfile
 import unittest
+
+from PIL import Image
 
 import test_planning as fixtures
 from go1loc.planning import build_route_graph, plan_route
 from go1loc.planning import import_current_start, validate_start_connection
+from go1loc.evidence import make_binding, verify_binding
+from go1loc.query_geometry import prepare_query
 
 
 RUN = "2026-10-13T10:00:00Z"
@@ -89,7 +97,7 @@ class PlanningTimeTests(unittest.TestCase):
         self.start.pop("attachment")
         self.assertEqual(self.replay()["failure_reason"], "start_not_connected")
         self.start = current_photo(self.graph)
-        self.target["query_id"] = self.start["query_id"]
+        self.target["query_sha256"] = self.start["photo_sha256"]
         self.assertEqual(self.replay()["failure_reason"], "target_photo_is_not_current_pose")
 
 
@@ -184,7 +192,7 @@ class StartImportTests(unittest.TestCase):
         bad_graph["map_hash"] = "b" * 64
         self.assertFalse(validate_start_connection(bad_graph, self.full, **self.clock)["valid"])
         target = fixtures.inputs(self.graph)[1]
-        target["query_id"] = self.current["query_id"]
+        target["query_sha256"] = self.current["photo_sha256"]
         self.assertFalse(validate_start_connection(self.graph, self.full, target=target, **self.clock)["valid"])
         for key, value in [("path", [[-1, 0, 0], [9, 9, 9]]), ("pts_time_s", [0, 9]),
                            ("verified_continuous", False), ("source_sha256", "bad")]:
@@ -192,6 +200,152 @@ class StartImportTests(unittest.TestCase):
                 document = deepcopy(self.full)
                 document["attachment"][key] = value
                 self.assertFalse(import_current_start(self.current, document, self.graph, **self.clock)["valid"])
+
+
+class OriginalPhotoIdentityTests(unittest.TestCase):
+    """Real file hashes/rectification, synthetic poses and route: NOT route acceptance."""
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.root = Path(self.temp.name)
+        self.photos = []
+        for source, color in (("target_capture", "red"), ("current_capture", "blue")):
+            directory = self.root/source
+            directory.mkdir()
+            photo = directory/"image.jpg"
+            Image.new("RGB", (40, 30), color).save(photo)
+            self.photos.append(photo)
+        self.calibration = self.root/"calibration.json"
+        self.calibration.write_text(json.dumps({"source": "synthetic_identity_test_only",
+            "model": "pinhole", "image_size": [40, 30], "output_size": [40, 30],
+            "map_version": "test", "K": [[30, 0, 20], [0, 30, 15], [0, 0, 1]],
+            "distortion": [0, 0, 0, 0]}))
+        self.graph = build_route_graph(*fixtures.fixture())
+        self.clock = dict(now=RUN, time_mode="offline_replay", replay_reference_time=REPLAY)
+
+    def binding(self, photo, folder, calibrated=False):
+        processed, geometry, _ = prepare_query(photo, self.root/folder,
+                                               self.calibration if calibrated else None)
+        binding = make_binding(photo, {"manifest_sha256": self.graph["map_hash"]},
+                               {"processed_query": processed}, geometry)
+        verify_binding(binding, photo, self.graph["map_hash"])
+        return processed.name, binding
+
+    def documents(self, *, current_calibrated=False, target_calibrated=False):
+        target_key, target_binding = self.binding(self.photos[0], "target_work", target_calibrated)
+        current_key, current_binding = self.binding(self.photos[1], "current_work", current_calibrated)
+        start = current_photo(self.graph)
+        start.update(query_id=current_key, query_sha256=current_binding["query_sha256"],
+                     photo_sha256=current_binding["query_sha256"], query_path=str(self.photos[1]))
+        start["attachment"].update(query_id=current_key, photo_sha256=start["photo_sha256"])
+        target = fixtures.inputs(self.graph)[1]
+        target.update(query_id=self.photos[0].name, query_path=str(self.photos[0]),
+                      query_sha256=target_binding["query_sha256"],
+                      roi_binding={"query_sha256": target_binding["query_sha256"]})
+        return start, target, target_key
+
+    def check(self, start, target, reason=None):
+        before = deepcopy((start, target))
+        result = plan_route(self.graph, start, target, **self.clock)
+        self.assertFalse(result["execution_permitted"])
+        self.assertEqual((start, target), before)
+        self.assertEqual(result["failure_reason"], reason)
+        self.assertEqual(result["status"], "rejected" if reason else "route_preview_only")
+        if reason:
+            self.assertEqual(result["path"], [])
+        else:
+            self.assertEqual(result["goal_frame_id"], "m.png")
+        preview = validate_start_connection(self.graph, start, target=target, **self.clock)
+        self.assertEqual(preview["valid"], reason is None)
+        if reason:
+            self.assertIn(reason, preview["reasons"])
+
+    def test_same_basename_different_raw_hashes_are_independent(self):
+        start, target, _ = self.documents()
+        self.assertEqual(start["query_id"], target["query_id"])
+        self.assertNotEqual(start["photo_sha256"], target["query_sha256"])
+        self.check(start, target)
+
+    def test_renamed_copy_same_raw_content_is_rejected(self):
+        copy = self.photos[1].with_name("renamed.jpg")
+        shutil.copyfile(self.photos[0], copy)
+        self.photos[1] = copy
+        start, target, _ = self.documents()
+        self.assertNotEqual(start["query_id"], target["query_id"])
+        self.check(start, target, "target_photo_is_not_current_pose")
+
+    def test_different_processing_retains_common_original_identity(self):
+        shutil.copyfile(self.photos[0], self.photos[1])
+        start, target, _ = self.documents(current_calibrated=True)
+        self.assertEqual(start["query_id"], "query_rectified.png")
+        self.assertEqual(start["photo_sha256"], target["query_sha256"])
+        self.check(start, target, "target_photo_is_not_current_pose")
+
+    def test_distinct_originals_share_rectified_algorithm_key(self):
+        # An original input can legitimately use the fixed processing basename.
+        target_photo = self.photos[0].with_name("query_rectified.png")
+        Image.new("RGB", (40, 30), "red").save(target_photo)
+        self.photos[0] = target_photo
+        start, target, target_key = self.documents(current_calibrated=True, target_calibrated=True)
+        self.assertEqual(start["query_id"], target_key)
+        self.assertEqual(start["query_id"], target["query_id"])
+        self.check(start, target)
+
+    def test_missing_invalid_or_conflicting_target_identity_fails_closed(self):
+        start, target, _ = self.documents()
+        start["query_id"] = start["attachment"]["query_id"] = "different-name.jpg"
+        for update, reason in [
+            ({}, "target_photo_evidence_missing"),
+            ({"query_sha256": None}, "target_photo_identity_invalid"),
+            ({"query_sha256": "not-a-hash"}, "target_photo_identity_invalid"),
+            ({"query_sha256": "a"*64, "photo_sha256": "b"*64}, "target_photo_identity_conflict"),
+            ({"query_sha256": "a"*64, "roi_binding": {"query_sha256": "b"*64}}, "target_photo_identity_conflict"),
+            ({"query_sha256": "a"*64, "roi_binding": {}}, "target_photo_identity_invalid"),
+            ({"query_sha256": "a"*64, "roi_binding": []}, "target_photo_identity_invalid"),
+        ]:
+            with self.subTest(update=update):
+                candidate = {k: v for k, v in target.items() if k not in ("query_sha256", "roi_binding")}
+                candidate.update(update)
+                self.check(start, candidate, reason)
+
+    def test_conflicting_current_original_aliases_are_not_independent(self):
+        start, target, _ = self.documents()
+        start["query_id"] = start["attachment"]["query_id"] = "different-name.jpg"
+        start["query_sha256"] = target["query_sha256"]
+        self.check(start, target, "current_photo_identity_conflict")
+
+    def test_missing_or_invalid_current_hash_cannot_establish_independence(self):
+        start, target, _ = self.documents()
+        for field, value, reason in [
+            ("photo_sha256", None, "current_photo_evidence_missing"),
+            ("photo_sha256", "invalid", "current_photo_evidence_missing"),
+            ("query_sha256", None, "current_photo_identity_invalid"),
+            ("query_sha256", "invalid", "current_photo_identity_invalid"),
+        ]:
+            with self.subTest(field=field, value=value):
+                candidate = deepcopy(start)
+                candidate[field] = value
+                self.check(candidate, target, reason)
+
+    def test_legacy_roi_only_identity_is_checked_not_guessed(self):
+        start, target, _ = self.documents()
+        target.pop("query_sha256")
+        self.check(start, target)
+        target["roi_binding"]["query_sha256"] = start["photo_sha256"]
+        self.check(start, target, "target_photo_is_not_current_pose")
+
+    def test_same_basename_does_not_bypass_other_binding_gates(self):
+        start, target, _ = self.documents()
+        for field, value, reason in [
+            ("map_hash", "f"*64, "map_hash_mismatch"),
+            ("captured_at", "2019-01-01T00:00:00Z", "stale_start"),
+            ("T_MC", fixtures.pose(5), "start_not_connected"),
+            ("attachment", {}, "start_not_connected"),
+        ]:
+            with self.subTest(field=field):
+                candidate = deepcopy(start)
+                candidate[field] = value
+                self.check(candidate, target, reason)
 
 
 if __name__ == "__main__":

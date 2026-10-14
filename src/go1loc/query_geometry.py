@@ -8,6 +8,11 @@ from .video import sha256_file
 
 
 def prepare_query(photo: Path, workspace: Path, calibration_path: Path | None):
+    """Return a workspace-local algorithm image, NOT a new observation identity.
+
+    Callers bind the original photo bytes separately via make_binding(photo, ...).
+    The fixed rectified basename must never establish cross-query equality.
+    """
     workspace.mkdir(parents=True, exist_ok=True)
     with Image.open(photo) as image:
         size = list(image.size)

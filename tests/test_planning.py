@@ -57,7 +57,8 @@ def inputs(graph, goal="m.png", start="z.png"):
     return ({**identity, "source": "explicit_pose", "manual": True,
              "node_id": start, "selected_at": CAPTURED},
             {**identity, "status": "supported", "supporting_frame_ids": [goal],
-             "object_surface_position": [123, 456, 789], "query_id": "target-photo"})
+             "object_surface_position": [123, 456, 789], "query_id": "target-photo",
+             "query_sha256": "d" * 64})
 
 
 class RoutePlanningTests(unittest.TestCase):
@@ -269,11 +270,12 @@ class RoutePlanningTests(unittest.TestCase):
 
     def test_target_photo_cannot_be_current_photo(self):
         self.start = self.current(True)
-        self.target["query_id"] = "current"
+        self.target["query_sha256"] = self.start["photo_sha256"]
         self.assert_rejected(self.plan(), "target_photo_is_not_current_pose")
 
     def test_target_roi_binding_hash_also_prevents_current_photo_reuse(self):
         self.start = self.current(True)
+        self.target.pop("query_sha256")  # Legacy target with only its verified ROI binding.
         self.target["roi_binding"] = {"query_sha256": self.start["photo_sha256"]}
         self.assert_rejected(self.plan(), "target_photo_is_not_current_pose")
 
