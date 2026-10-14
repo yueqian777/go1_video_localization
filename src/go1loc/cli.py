@@ -31,6 +31,14 @@ def main(argv=None) -> int:
     prep.add_argument("--output", default="data/processed/clip")
     prep.add_argument("--config", help="JSON object with FrameConfig fields")
     prep.add_argument("--calibration", help="Source-attributed camera calibration JSON")
+    prep.add_argument('--screen-config', help='Confirmed native-size screen crop/mask JSON; source stays screen_display')
+    inspect = sub.add_parser('inspect-screen', help='Decode native-size preview before selecting a fixed single view')
+    inspect.add_argument('video')
+    inspect.add_argument('--output', required=True)
+    diag = sub.add_parser('diagnose-screen', help='Bounded real masked SuperPoint/LightGlue pairs; no pose acceptance')
+    diag.add_argument('--import-dir', required=True)
+    diag.add_argument('--output', required=True)
+    diag.add_argument('--pairs', type=int, default=3)
     mapping = sub.add_parser("build-map")
     mapping.add_argument("--images", required=True)
     mapping.add_argument("--output", required=True)
@@ -47,6 +55,7 @@ def main(argv=None) -> int:
     localize.add_argument('--camera-params', nargs='+', type=float)
     localize.add_argument('--calibration')
     localize.add_argument('--capture-time', help='Actual capture time in ISO8601, not file mtime')
+    localize.add_argument('--frames-manifest', help='Original screen import manifest for a moved independent query PNG')
     photo_object = sub.add_parser('locate-photo-object')
     photo_object.add_argument('--photo', required=True)
     photo_object.add_argument('--map', required=True)
@@ -60,6 +69,7 @@ def main(argv=None) -> int:
     photo_object.add_argument('--camera-params', nargs='+', type=float)
     photo_object.add_argument('--calibration')
     photo_object.add_argument('--capture-time')
+    photo_object.add_argument('--frames-manifest')
     obj = sub.add_parser("locate-object")
     obj.add_argument("--observations", required=True, help="JSON list of ROI-to-3D observations")
     obj.add_argument("--points3d", required=True, help="JSON object mapping point3D_id to [x,y,z]")
@@ -102,13 +112,32 @@ def main(argv=None) -> int:
         write_doctor(_path(args.output), report)
         print(json.dumps(report, indent=2, ensure_ascii=False))
         return 0
+    if args.command == 'inspect-screen':
+        from .screen_import import inspect_screen
+        try:
+            print(json.dumps(inspect_screen(_path(args.video), _path(args.output)), indent=2, ensure_ascii=False))
+            return 0
+        except (VideoPipelineError, OSError, ValueError) as exc:
+            print(json.dumps({'status': 'pipeline_error', 'failure_reason': str(exc)}, ensure_ascii=False))
+            return 2
+    if args.command == 'diagnose-screen':
+        from .screen_diagnostics import diagnose_screen
+        try:
+            print(json.dumps(diagnose_screen(_path(args.import_dir), _path(args.output), args.pairs), indent=2))
+            return 0
+        except (ValueError, OSError, RuntimeError) as exc:
+            print(json.dumps({'status': 'pipeline_error', 'failure_reason': str(exc)}))
+            return 2
     if args.command == "prepare-video":
         try:
             config = FrameConfig(**json.loads(_path(args.config).read_text(encoding='utf-8'))) if args.config else FrameConfig()
-            result = prepare_video(_path(args.video),_path(args.output),config,_path(args.calibration) if args.calibration else None)
+            from .screen_import import ScreenConfig
+            screen_config = ScreenConfig(**_read_json(args.screen_config)) if args.screen_config else None
+            result = prepare_video(_path(args.video),_path(args.output),config,_path(args.calibration) if args.calibration else None,
+                                   screen_config=screen_config)
             print(json.dumps(result, indent=2, ensure_ascii=False))
             return 0
-        except VideoPipelineError as exc:
+        except (VideoPipelineError, OSError, ValueError, TypeError) as exc:
             print(json.dumps({"status": "pipeline_error", "failure_reason": str(exc)}, ensure_ascii=False))
             return 2
     if args.command == "build-map":
@@ -217,7 +246,8 @@ def main(argv=None) -> int:
 def _query_config(args):
     return LocalizationConfig(query_camera_model=args.camera_model, query_camera_params=args.camera_params,
                               calibration_path=_path(args.calibration) if args.calibration else None,
-                              capture_time=args.capture_time)
+                              capture_time=args.capture_time,
+                              frames_manifest_path=_path(args.frames_manifest) if getattr(args, 'frames_manifest', None) else None)
 
 
 def _read_json(path):

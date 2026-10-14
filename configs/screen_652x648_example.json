@@ -1,0 +1,15 @@
+{
+  "source_size_wh": [652, 648],
+  "crop_xywh": [0, 0, 652, 648],
+  "output_size_wh": [652, 648],
+  "selected_window": "EXAMPLE ONLY: confirm the fixed single view on your native decoded frame",
+  "camera_id": null,
+  "camera_label": "unknown",
+  "display_mode": "unknown",
+  "display_evidence": "No verified display projection; do not additionally undistort",
+  "calibration_status": "unknown",
+  "expected_source_sha256": null,
+  "exclude_rectangles": [[326, 0, 5, 648], [0, 318, 652, 5], [39, 31, 58, 60]],
+  "margin_px": 12,
+  "border_px": 6
+}

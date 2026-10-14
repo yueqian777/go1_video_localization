@@ -209,7 +209,8 @@ def frame_quality(image, config: FrameConfig, previous=None) -> dict:
 
 
 def prepare_video(path: Path, output_dir: Path, config: FrameConfig | None = None,
-                  calibration_path: Path | None = None, *, events: BoundedEventWriter | None = None) -> dict:
+                  calibration_path: Path | None = None, *, events: BoundedEventWriter | None = None,
+                  screen_config=None) -> dict:
     """Prepare frames; emit events outside the immutable cached frame directory."""
     output_dir = output_dir.resolve()
     if events:
@@ -218,7 +219,13 @@ def prepare_video(path: Path, output_dir: Path, config: FrameConfig | None = Non
         sidecar = output_dir.with_name(output_dir.name + '.sidecar') / uuid4().hex
         events = BoundedEventWriter(sidecar / 'events.jsonl')
     with events.stage('video'):
-        result = _prepare_video(path, output_dir, config, calibration_path, events)
+        if screen_config is not None:
+            if calibration_path is not None:
+                raise VideoPipelineError('screen_rectification_requires_verified_display_geometry_not_supported')
+            from .screen_import import prepare_screen
+            result = prepare_screen(path, output_dir, config or FrameConfig(), screen_config, events)
+        else:
+            result = _prepare_video(path, output_dir, config, calibration_path, events)
     events.emit('final', stage='video', data={'frames_manifest': str(output_dir / 'frames_manifest.json'),
                 'candidate_count': result['candidate_count'], 'kept_count': result['kept_count']})
     return result

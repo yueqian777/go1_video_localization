@@ -234,6 +234,8 @@ def _localization_config(value):
         raise ValueError('map_updates_disabled')
     if value.get('calibration_path'):
         value['calibration_path'] = Path(value['calibration_path'])
+    if value.get('frames_manifest_path'):
+        value['frames_manifest_path'] = Path(value['frames_manifest_path'])
     return LocalizationConfig(**value)
 
 

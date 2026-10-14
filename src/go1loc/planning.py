@@ -20,7 +20,7 @@ import numpy as np
 
 IDENTITY = ("map_id", "map_hash", "component_id")
 PHOTO_BINDING = (*IDENTITY, "query_id", "photo_sha256", "captured_at", "localized_at")
-SOURCE_KINDS = {"video", "synthetic_test"}
+SOURCE_KINDS = {"video", "synthetic_test", "go1_screen_recording"}
 POSE_ATOL = 1e-7  # Numerical consistency, NOT a physical snapping radius.
 
 
@@ -242,6 +242,9 @@ def build_route_graph(manifest: dict, reference_poses: dict,
         elif (not _sha256(source_sha)
               or segment.get("source_sha256") != source_sha):
             reason = "video_source_hash_mismatch"
+        elif ((frames_manifest or {}).get('source_kind') is not None
+              and segment.get('source_kind') != frames_manifest['source_kind']):
+            reason = 'segment_source_kind_mismatch'
         elif any(segment.get(k) != graph[k] for k in ("map_id", "map_hash")):
             reason = "segment_map_mismatch"
         names = segment.get("frame_names")

@@ -9,7 +9,7 @@ from __future__ import annotations
 from copy import deepcopy
 
 from .planning import (_digest, _edge_rejection, _frame_index, _frame_name,
-                       _number, _position, _sha256, _time, build_route_graph)
+                       _number, _position, _sha256, _time, build_route_graph, SOURCE_KINDS)
 
 
 MAX_FRAMES = 100_000
@@ -85,7 +85,7 @@ def generate_route_candidates(manifest: dict, reference_poses: dict,
                            "camera_route_not_body_or_footstep_route"]}
     if not _sha256(review["source_sha256"]):
         review["diagnostics"].append({"reason": "video_source_hash_required"})
-    if review["source_kind"] not in {"video", "synthetic_test"}:
+    if review["source_kind"] not in SOURCE_KINDS:
         review["diagnostics"].append({"reason": "unsupported_source_kind"})
     rows, order = _frame_index(frames_manifest, review["diagnostics"])
     if not rows:
@@ -121,7 +121,7 @@ def generate_route_candidates(manifest: dict, reference_poses: dict,
         for reason in reasons:
             review["diagnostics"].append({"timeline_index": index, "frame_name": name, "reason": reason})
     source_valid = (_sha256(review["source_sha256"])
-                    and review["source_kind"] in {"video", "synthetic_test"})
+                    and review["source_kind"] in SOURCE_KINDS)
     if not source_valid:
         return _seal(review)
     group = []

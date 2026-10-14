@@ -58,7 +58,7 @@ def _remove_owned_directory(path: Path, parent: Path) -> None:
 class SnapshotPublisher:
     def __init__(self, root: Path, *, events: BoundedEventWriter | None = None,
                  max_count: int = 20, max_bytes: int = 512 * 1024 * 1024,
-                 model_loader=None):
+                 model_loader=None, timing_source: str = 'video_pts_not_exposure_time', source_kind: str | None = None):
         if not 1 <= max_count <= 1000 or max_bytes < 1:
             raise ValueError('invalid_snapshot_budget')
         self.root = Path(root).resolve()
@@ -66,6 +66,7 @@ class SnapshotPublisher:
         self.events = events
         self.max_count, self.max_bytes = max_count, max_bytes
         self.model_loader = model_loader or _load_model
+        self.timing_source, self.source_kind = timing_source, source_kind
         self.count = 0
         self.bytes_written = 0
         self.overhead_s = 0.0
@@ -123,7 +124,9 @@ class SnapshotPublisher:
                    'registered_images': int(model.num_reg_images()),
                    'points3D': int(model.num_points3D()), 'model_sha256': before,
                    'frames': frames, 'frame_order': 'unordered_use_pts_for_video_time',
-                   'exposure_time': None, 'timing_source': 'video_pts_not_exposure_time'}
+                   'exposure_time': None, 'timing_source': self.timing_source}
+            if self.source_kind is not None:
+                row['source_kind'] = self.source_kind
             row['snapshot_sha256'] = hashlib.sha256(json.dumps(
                 row, sort_keys=True, ensure_ascii=False, allow_nan=False).encode('utf-8')).hexdigest()
             encoded = json.dumps(row, ensure_ascii=False, allow_nan=False, indent=2).encode('utf-8')

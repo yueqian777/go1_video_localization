@@ -195,6 +195,10 @@ def _write_manifest(output_dir: Path, config: MappingConfig, image_dir: Path, mo
         frame_bytes = frame_manifest.read_bytes()
         manifest['frames_manifest'] = json.loads(frame_bytes)
         manifest['frames_manifest_sha256'] = hashlib.sha256(frame_bytes).hexdigest()
+        if manifest['frames_manifest'].get('source_kind') == 'go1_screen_recording':
+            manifest['source_kind'] = 'go1_screen_recording'
+            manifest['timing_source'] = 'screen_display'
+            manifest['execution_permitted'] = False
     else:
         manifest['frames_manifest'] = None
         manifest['frames_manifest_sha256'] = None
@@ -309,7 +313,7 @@ def build_map(image_dir: Path, output_dir: Path, config: MappingConfig | None = 
             if len(refs) < 2:
                 raise PipelineInputError('mapping_requires_at_least_two_images')
             refs, frame_times, frame_data = _video_references(image_dir, refs)
-            run.update(source_kind='video_pts_extracted_frames' if frame_data is not None else 'unordered_images',
+            run.update(source_kind=frame_data.get('source_kind', 'video_pts_extracted_frames') if frame_data is not None else 'unordered_images',
                        num_reference_images=len(refs), stage='mapping')
             publish_run(run_dir, run)
             stage_dir = _ascii_stage(image_dir, refs)
@@ -379,6 +383,8 @@ def _build_map(image_dir, output_dir, config, refs, frame_times, frame_data, wor
         pairs_from_exhaustive.main(pairs_path, image_list=refs)
     with events.stage('local_features'):
         extract_features.main(feature_conf, work_image_dir, output_dir, image_list=refs, feature_path=local_path)
+        from .feature_masks import filter_screen_map_features
+        filter_screen_map_features(local_path, image_dir, refs, frame_data, output_dir/'mask_diagnostics')
     with events.stage('matching'):
         pair_count = sum(bool(line.strip()) for line in pairs_path.read_text(encoding='utf-8').splitlines())
         events.emit('match_progress', stage='matching', data={'pairs_requested': pair_count,
@@ -399,8 +405,11 @@ def _build_map(image_dir, output_dir, config, refs, frame_times, frame_data, wor
     publisher = None
     with events.stage('reconstruction'):
         if config.snapshot_frames_freq:
+            screen_source = frame_data is not None and frame_data.get('source_kind') == 'go1_screen_recording'
             publisher = SnapshotPublisher(run_dir / 'snapshots', events=events,
-                                          max_count=config.snapshot_max_count, max_bytes=config.snapshot_max_bytes)
+                max_count=config.snapshot_max_count, max_bytes=config.snapshot_max_bytes,
+                timing_source='screen_display' if screen_source else 'video_pts_not_exposure_time',
+                source_kind='go1_screen_recording' if screen_source else None)
             model = _reconstruct_with_snapshots(reconstruction, sfm_dir, work_image_dir, pairs_path,
                        local_path, match_path, refs, camera_mode, image_options, mapper_options,
                        publisher, config, frame_times, events)

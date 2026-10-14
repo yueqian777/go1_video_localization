@@ -32,6 +32,7 @@ class LocalizationConfig:
     query_camera_params: list[float] | None = None
     calibration_path: Path | None = None
     capture_time: str | None = None
+    frames_manifest_path: Path | None = None
 
 
 def _require_backend():
@@ -100,6 +101,9 @@ def localize_photo(query_path: Path, map_dir: Path, output_dir: Path, config: Lo
     validation = validate_image_path(query_path, query_path.parent)
     if not validation.ok:
         return _save_result(output_dir, LocalizationResult.failure(query_id=query_path.name, map_id=map_id, reason="invalid_query_" + str(validation.reason)))
+    from .feature_masks import query_screen_binding, read_mask, filter_features
+    screen_binding = query_screen_binding(query_path, manifest, config.frames_manifest_path,
+                                          config.calibration_path, config.capture_time)
     project_root = Path(__file__).resolve().parents[2]
     os.environ.setdefault("TORCH_HOME", str(project_root / ".models" / "torch"))
     pycolmap, extract_features, localize_sfm, match_features, pairs_from_retrieval = _require_backend()
@@ -112,6 +116,14 @@ def localize_photo(query_path: Path, map_dir: Path, output_dir: Path, config: Lo
     query_workspace = output_dir / "query_workspace"
     query_workspace.mkdir(parents=True, exist_ok=True)
     query_copy, geometry, rectification = prepare_query(query_path, query_workspace, config.calibration_path)
+    if screen_binding:
+        geometry['screen_observation'] = screen_binding
+        # Independent imports often both start at frame_00000000.png. Give hloc
+        # a unique internal key without changing the original observation hash.
+        from .video import sha256_file
+        unique_copy = query_copy.with_name('screen_query_'+sha256_file(query_path)[:24]+'.png')
+        query_copy.rename(unique_copy)
+        query_copy = unique_copy
     geometry['intrinsics_request'] = {'model': config.query_camera_model,
                                      'params': config.query_camera_params,
                                      'calibration_sha256': geometry.get('calibration_sha256')}
@@ -141,6 +153,9 @@ def localize_photo(query_path: Path, map_dir: Path, output_dir: Path, config: Lo
     finally:
         if query_stage:
             shutil.rmtree(query_stage, ignore_errors=True)
+    if screen_binding:
+        filter_features(local_query, {query_name: read_mask(Path(screen_binding['mask_path']))},
+                        image_paths={query_name: query_copy}, diagnostics_dir=output_dir/'mask_diagnostics')
     match_features.main(matcher_conf, query_pairs, features=local_query, features_ref=db_local, matches=query_matches, overwrite=True)
     if config.query_camera_model or rectification is not None:
         try:
@@ -213,7 +228,9 @@ def localize_photo(query_path: Path, map_dir: Path, output_dir: Path, config: Lo
                               'total_s': time.perf_counter() - total_started})
         binding = make_binding(query_path, manifest,
             {'query_features': local_query, 'matches': query_matches, 'reference_features': db_local,
-             'processed_query': query_copy, 'calibration': config.calibration_path}, geometry)
+             'processed_query': query_copy, 'calibration': config.calibration_path,
+             'screen_frames_manifest': Path(screen_binding['manifest_path']) if screen_binding else None,
+             'feature_exclusion_mask': Path(screen_binding['mask_path']) if screen_binding else None}, geometry)
         result.query_sha256 = binding['query_sha256']  # Original bytes, before rectification.
         result.evidence_path = str(output_dir/'query_evidence.json')
         evidence = {'schema_version': 'go1loc.evidence.v1', 'query_path': str(query_path),
