@@ -18,6 +18,8 @@ import threading
 from uuid import uuid4
 
 KINDS = {
+    'inspect_video': {'upload_id'},
+    'build_video': {'upload_id', 'settings'},
     'inspect_map': {'component_id', 'point_budget'},
     'inspect_snapshot': {'snapshot_dir', 'snapshot_index', 'point_budget'},
     'inspect_build_snapshot': {'run_dir', 'snapshot_index', 'point_budget'},
@@ -244,6 +246,9 @@ def _localization_config(value):
 
 def execute_job(request):
     kind, params = request['kind'], request['params']
+    if kind in ('inspect_video', 'build_video'):
+        from .web_build import execute_web_job
+        return execute_web_job(request)
     map_dir = Path(request['map_dir'])
     output = Path(request['job_dir'])/'output'
     if kind == 'inspect_map':

@@ -22,6 +22,7 @@ from .viewer_workflows import RouteWorkflowControls
 from .viewer_text import VIEW_MODES, human_status, protocol_value, save_uploaded_image
 from .playback import PlaybackControls
 from .build_guide import BuildGuideControls
+from .web_build_ui import WebBuildControls
 
 POINT_BUDGET = 50000
 PHOTO_PLANE_Z = 10000.0
@@ -307,7 +308,7 @@ def _app_locked(method):
     return locked
 
 
-class ViewerApplication(RouteWorkflowControls, PlaybackControls, BuildGuideControls):
+class ViewerApplication(RouteWorkflowControls, PlaybackControls, BuildGuideControls, WebBuildControls):
     def __init__(self, map_dir, sidecar_dir, *, port=8765, query_dir=None, snapshot_dir=None, server=None):
         self.map_dir = Path(map_dir).resolve()
         self.sidecar = ensure_sidecar(self.map_dir, sidecar_dir)
@@ -373,6 +374,7 @@ class ViewerApplication(RouteWorkflowControls, PlaybackControls, BuildGuideContr
         self.notice = gui.add_text('当前提示', '正在读取地图，请稍候。', multiline=True, disabled=True)
         self.overview = gui.add_markdown('地图载入后显示任务进度。')
         self._button('恢复地图总览', self._return_map)
+        self._web_build_ui()
         with gui.add_folder('新手先看：图中是什么？', expand_by_default=False):
             gui.add_markdown('**散点**：从多张照片估计的三维特征，不是完整墙面；没有点不代表没有障碍。\n\n'
                 '**蓝色线框**：历史相机位置和朝向；**黄色点**：目标表面证据；**绿色相机**：目标观察位置。\n\n'
@@ -445,8 +447,8 @@ class ViewerApplication(RouteWorkflowControls, PlaybackControls, BuildGuideContr
             self._button('保存三维画布截图', self._screenshot)
             gui.add_markdown('截图仅包含三维画布，不包含面板。下方保留原始英文错误码和文件位置，便于复核。')
             self.status = gui.add_text('原始诊断记录', '', multiline=True, disabled=True)
-            gui.add_text('当前地图目录', str(self.map_dir), disabled=True)
-            gui.add_text('结果保存目录', str(self.sidecar), disabled=True)
+            self.map_directory = gui.add_text('当前地图目录', str(self.map_dir), disabled=True)
+            self.results_directory = gui.add_text('结果保存目录', str(self.sidecar), disabled=True)
 
     def _photo_upload(self, label, field):
         button = self.server.gui.add_upload_button(label, mime_type='image/png,image/jpeg',
@@ -488,25 +490,27 @@ class ViewerApplication(RouteWorkflowControls, PlaybackControls, BuildGuideContr
     def _poll(self):
         while not self._stop.is_set():
             try:
-                for state in self.jobs.list_jobs():
-                    job_id = state['job_id']
-                    if job_id in self._seen:
-                        continue
-                    if state['status'] == 'completed':
-                        self._seen.add(job_id)
-                        self._completed(state)
-                    elif state['status'] == 'failed':
-                        self._seen.add(job_id)
-                        self._message('Job failed: '+state.get('error', 'unknown'))
-                    elif state['status'] == 'running':
-                        self._message(f"Running {state['kind']}; pid={state.get('worker_pid')}; job={job_id}")
+                with self._state_lock:
+                    for state in self.jobs.list_jobs():
+                        job_id = state['job_id']
+                        if job_id in self._seen:
+                            continue
+                        if state['status'] == 'completed':
+                            self._seen.add(job_id)
+                            self._completed(state)
+                        elif state['status'] == 'failed':
+                            self._seen.add(job_id)
+                            self._message('Job failed: '+state.get('error', 'unknown'))
+                        elif state['status'] == 'running':
+                            self._message(f"Running {state['kind']}; pid={state.get('worker_pid')}; job={job_id}")
+                    self._web_tick()
             except Exception as exc:
                 self._message(f'{type(exc).__name__}: {exc}')
             self._stop.wait(.5)
 
     @_app_locked
     def _completed(self, state):
-        if (state.get('job_id') is not None and state['kind'] not in ('inspect_map', 'inspect_snapshot')
+        if (state.get('job_id') is not None
                 and self._job_revisions.get(state['job_id']) != self._task_revision):
             self._message('Ignored completed job from an obsolete task; saved files retained: '+state['job_id'])
             return
@@ -516,10 +520,11 @@ class ViewerApplication(RouteWorkflowControls, PlaybackControls, BuildGuideContr
         result_path = Path(state['result_path'])
         payload = read_json(result_path)
         kind = state['kind']
-        if kind in ('inspect_map', 'inspect_snapshot'):
+        if kind in ('inspect_map', 'inspect_snapshot', 'inspect_build_snapshot'):
             self._invalidate_target(clear_query=True)
             self._query_selected = False
             self.controller.replace_model(payload)
+            self._web_applied_job = state.get('job_id')
             self.reference_image.visible = False
             self.reference_info.value = '地图已切换，请重新选择参考帧。'
             self._reset_workflows()
@@ -858,6 +863,7 @@ class ViewerApplication(RouteWorkflowControls, PlaybackControls, BuildGuideContr
         self._thread.join(timeout=2)
         self._playback_thread.join(timeout=2)
         self.jobs.close()  # deliberately do not kill compute when UI stops
+        self._web_close()
         self.server.stop()
 
 

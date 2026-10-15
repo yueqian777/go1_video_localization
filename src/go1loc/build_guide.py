@@ -68,8 +68,8 @@ def build_recipe(project, sidecar, video, output, kind, *, screen_config=None, d
 class BuildGuideControls:
     def _build_guide_ui(self):
         gui = self.server.gui
-        with gui.add_folder('以后自己建图：生成操作单', expand_by_default=False):
-            gui.add_markdown('当前快捷方式只打开已有地图。这里生成新视频的操作命令，**不会自动开始建图**。先试 30 秒，检查质量后再重建；每次使用新目录。')
+        with gui.add_folder('高级备用：导出命令操作单', expand_by_default=False):
+            gui.add_markdown('日常建图请使用页面顶部「新建地图」。这里仅供需要命令行复现时生成操作单，**不会自动开始建图**。')
             self.build_video = gui.add_text('新视频完整路径', '')
             self.build_output = gui.add_text('新建图输出目录（必须尚不存在）', '')
             self.build_kind = gui.add_dropdown('视频来源类型', ['Go1 界面录屏', '原始单路视频'])
