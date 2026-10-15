@@ -216,12 +216,15 @@ def scene_payload(map_dir, *, component_id=None, point_budget=50000, snapshot=No
         points = [points[i] for i in np.linspace(0, total-1, int(point_budget), dtype=int)]
     # Frame list remains real PTS ordered only when timestamps exist.
     cameras.sort(key=lambda c: (c['pts_time_s'] is None, c['pts_time_s'] or 0, c['image_id']))
+    from .playback import playback_timeline
+    playback = playback_timeline(frame_manifest if not snapshot else None, cameras, image_dir)
     return {'schema_version': 'go1loc.viewer_scene.v1', 'map_id': manifest['map_id'],
             'map_hash': manifest['manifest_sha256'], 'component_id': component_id, 'mode': mode,
             'revision': snapshot['snapshot_index'] if snapshot else manifest['manifest_sha256'],
             'units': manifest['units'], 'scale_status': manifest['scale_status'],
             'points': [p.xyz.tolist() for _, p in points], 'colors': [p.color.tolist() for _, p in points],
             'point_ids': [int(pid) for pid, _ in points], 'total_points': total, 'cameras': cameras,
+            'playback': playback,
             'pts_available': bool(cameras) and all(c['pts_time_s'] is not None for c in cameras),
             'warnings': ['historical_visualization_not_navigation', 'unaligned_components_are_not_combined'],
             'execution_permitted': False}

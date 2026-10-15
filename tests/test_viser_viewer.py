@@ -72,7 +72,7 @@ class Gui:
                 self.labels.append(args[0])
             value = kwargs.get('initial_value', args[1] if len(args) > 1 else None)
             options = args[1] if method == 'add_dropdown' else []
-            if options:
+            if options and 'initial_value' not in kwargs:
                 value = options[0]
             result = SimpleNamespace(value=value, options=options, visible=kwargs.get('visible', True))
             result.on_click = lambda cb: setattr(result, 'click', cb)

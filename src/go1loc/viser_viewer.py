@@ -20,6 +20,8 @@ import numpy as np
 from .jobs import JobManager, atomic_json, ensure_sidecar, read_json, utc_now
 from .viewer_workflows import RouteWorkflowControls
 from .viewer_text import VIEW_MODES, human_status, protocol_value, save_uploaded_image
+from .playback import PlaybackControls
+from .build_guide import BuildGuideControls
 
 POINT_BUDGET = 50000
 PHOTO_PLANE_Z = 10000.0
@@ -305,7 +307,7 @@ def _app_locked(method):
     return locked
 
 
-class ViewerApplication(RouteWorkflowControls):
+class ViewerApplication(RouteWorkflowControls, PlaybackControls, BuildGuideControls):
     def __init__(self, map_dir, sidecar_dir, *, port=8765, query_dir=None, snapshot_dir=None, server=None):
         self.map_dir = Path(map_dir).resolve()
         self.sidecar = ensure_sidecar(self.map_dir, sidecar_dir)
@@ -342,6 +344,7 @@ class ViewerApplication(RouteWorkflowControls):
         self._submit('inspect_map', {})
         self._thread = threading.Thread(target=self._poll, name='go1loc-viewer-poll', daemon=True)
         self._thread.start()
+        self._start_playback_thread()
 
     def _message(self, text):
         self.status.value = str(text)[:8000]
@@ -392,6 +395,8 @@ class ViewerApplication(RouteWorkflowControls):
             self.reference_image = gui.add_image(np.zeros((2, 2, 3), np.uint8), label='历史参考照片（不是实时画面）', visible=False)
             self.reference_info = gui.add_text('所选参考帧信息', '请选择参考帧并点击查看。', multiline=True, disabled=True)
             gui.add_markdown('参考帧的时间是素材记录时间。屏幕录制的显示时间不等于传感器曝光时间。')
+            self._playback_ui()
+            self._build_guide_ui()
         with self._object_tab:
             gui.add_markdown('### 用独立照片寻找物体\n**选照片 → 打开原图 → Shift 拖动框选 → 计算。**\n\n'
                 '正式验证请使用未参与建图的独立采集照片。输出是可见表面的三维支持点，不是自动识别出的完整物体。')
@@ -522,6 +527,7 @@ class ViewerApplication(RouteWorkflowControls):
             self.target_result = None
             self.frame.options = [c['name'] for c in payload['cameras']] or ['(no frames)']
             self.frame.value = self.frame.options[0]
+            self._reset_playback(payload)
             for client in self.server.get_clients().values():
                 self._focus_map(client)
             self._message(f"{payload['mode']} | {len(payload['cameras'])} cameras | "
@@ -596,6 +602,7 @@ class ViewerApplication(RouteWorkflowControls):
         self._show_frame(event)
 
     def _show_frame(self, event):
+        self._pause_playback()
         camera = self._reference()
         self.controller.pose('reference', camera['T_WC'], color=(240, 125, 235))
         pts = camera.get('pts_time_s')
@@ -613,6 +620,7 @@ class ViewerApplication(RouteWorkflowControls):
                       f"mode={self.controller.mode}. Reference camera is NOT current pose.")
 
     def _load_mode(self, _):
+        self._pause_playback()
         if protocol_value(self.mode.value, VIEW_MODES) == 'build_snapshot':
             if not self.snapshot_dir:
                 raise ValueError('no_ready_snapshot: snapshot directory not supplied')
@@ -623,6 +631,7 @@ class ViewerApplication(RouteWorkflowControls):
             self._submit('inspect_map', {'component_id': self.component.value.strip() or None})
 
     def _open_photo(self, event):
+        self._pause_playback()
         from PIL import Image
         if event.client is None:
             raise ValueError('photo_selection_requires_browser_client')
@@ -647,6 +656,7 @@ class ViewerApplication(RouteWorkflowControls):
         self._message('RAW PHOTO: Shift + drag a rectangle. Do not orbit; reopen photo to reset orientation.')
 
     def _return_map(self, event):
+        self._pause_playback()
         if event.client:
             state = self._photo_states.pop(event.client_id, None)
             if state:
@@ -846,6 +856,7 @@ class ViewerApplication(RouteWorkflowControls):
     def close(self):
         self._stop.set()
         self._thread.join(timeout=2)
+        self._playback_thread.join(timeout=2)
         self.jobs.close()  # deliberately do not kill compute when UI stops
         self.server.stop()
 
