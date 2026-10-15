@@ -52,8 +52,24 @@ class Scene:
 
 
 class Gui:
+    def __init__(self):
+        self.labels = []
+        self.tabs = []
+
+    def add_folder(self, label, **kwargs):
+        self.labels.append(label)
+        return nullcontext()
+
+    def add_tab_group(self, **kwargs):
+        def tab(label, **kwargs):
+            self.tabs.append(label)
+            return nullcontext()
+        return SimpleNamespace(add_tab=tab)
+
     def __getattr__(self, method):
         def add(*args, **kwargs):
+            if args:
+                self.labels.append(args[0])
             value = kwargs.get('initial_value', args[1] if len(args) > 1 else None)
             options = args[1] if method == 'add_dropdown' else []
             if options:
@@ -61,6 +77,7 @@ class Gui:
             result = SimpleNamespace(value=value, options=options, visible=kwargs.get('visible', True))
             result.on_click = lambda cb: setattr(result, 'click', cb)
             result.on_update = lambda cb: setattr(result, 'update', cb)
+            result.on_upload = lambda cb: setattr(result, 'upload', cb)
             return result
         return add
 

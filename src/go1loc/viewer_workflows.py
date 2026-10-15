@@ -14,6 +14,7 @@ from .jobs import atomic_json, read_json, utc_now
 from .planning import import_current_start, validate_start_connection, _valid_graph, _time_context
 from .route_review import review_route_candidate
 from .video import sha256_file
+from .viewer_text import TIME_MODES, protocol_value
 
 
 def verified_current_query(directory, model, target_photo=None):
@@ -51,47 +52,56 @@ class RouteWorkflowControls:
         self.route_review = None
         self._review_revision = 0
         self._review_jobs = {}
-        gui.add_markdown('### Time and independent current-photo connection\n'
-            'live_current checks 30-second freshness. offline_replay keeps real capture time; '
-            'both are non-executable previews. Imported evidence is never auto-approved.')
-        self.time_mode = gui.add_dropdown('Planning time mode', ['live_current', 'offline_replay'])
-        self.replay_time = gui.add_text('Replay reference time (ISO8601 + timezone)', '')
+        with self._plan_tab:
+            with gui.add_folder('时间模式：当前 / 历史回放', expand_by_default=True):
+                gui.add_markdown('真实当前照片检查 30 秒新鲜度；历史实验请选择离线回放，另填回放参考时间。不得把旧照片拍摄时间改为现在。两种模式都只是预览。')
+                self.time_mode = gui.add_dropdown('时间核验方式', list(TIME_MODES))
+                self.replay_time = gui.add_text('回放参考时间（含时区）', '', hint='仅离线回放使用，例如 2026-10-14T12:00:00+08:00；必须与素材时间语义一致。')
         self.time_mode.on_update(self._guard(self._workflow_context_changed))
         self.replay_time.on_update(self._guard(self._workflow_context_changed))
         self.graph_path.on_update(self._guard(self._workflow_context_changed))
-        self.current_query = gui.add_text('Saved INDEPENDENT current query directory', '')
-        self._button('Load verified current query (no automatic attachment)', self._load_current_query)
-        self.connection_info = gui.add_text('Connection evidence / missing fields', 'No current connection inspected', multiline=True, disabled=True)
-        self.connection_node = gui.add_dropdown('Graph nodes (candidates, NOT automatic attachment)', ['(none)'])
-        self._button('Inspect graph and current connection', self._inspect_connection)
-        self._button('Show selected candidate node only', self._show_connection_node)
-        self.attachment_path = gui.add_text('Import current_start or attachment JSON path', '')
-        self.attachment_source = gui.add_text('Connection source file (required to adopt; SHA256 checked)', '')
-        self._button('Inspect imported connection (do not adopt)', self._inspect_attachment)
-        self._button('Adopt inspected evidence for OFFLINE preview', self._adopt_attachment)
-        gui.add_markdown('Review the original source before adopting. Hashes prove file consistency, '
-            'not that its claimed trajectory is physically continuous. A single photo alone cannot supply this evidence.')
-        gui.add_markdown('### Historical segment review\nCandidates start PENDING. '
-            'Inspect the original video for unmarked cuts; PTS continuity alone is not proof.')
-        self.review_gap = gui.add_number('Maximum candidate time gap (seconds)', 2., min=.01, step=.1)
-        self._button('Generate PENDING candidates from frozen map inputs', self._prepare_review)
-        self.review_info = gui.add_text('Review source / timeline / diagnostics', 'No review loaded', multiline=True, disabled=True)
-        self.review_candidate = gui.add_dropdown('PENDING segment', ['(none)'])
-        self.review_candidate_info = gui.add_text('Selected segment frames / real PTS', 'No pending segment', multiline=True, disabled=True)
-        self.review_candidate.on_update(self._guard(self._select_review_candidate))
-        self.review_first = gui.add_dropdown('Selected range first frame', ['(none)'])
-        self.review_last = gui.add_dropdown('Selected range last frame', ['(none)'])
-        self.review_frame = gui.add_dropdown('Inspect timeline row (including unregistered)', ['(none)'])
-        self._button('Show review frame / PTS / registration', self._show_review_frame)
-        self.reviewer = gui.add_text('Reviewer name (required)', '')
-        self.review_note = gui.add_text('Continuity evidence / split / rejection note (required)', '', multiline=True)
-        self._button('Split selected range; children stay PENDING', lambda _: self._review_decide('split'))
-        self._button('Confirm entire reviewed segment', lambda _: self._review_decide('confirm'))
-        self._button('Reject entire segment', lambda _: self._review_decide('reject'))
-        self._button('Save reviewed segments and directed graph', self._save_review)
+        with self._start_tab:
+            with gui.add_folder('进阶：复用独立照片定位结果', expand_by_default=False):
+                self.current_query = gui.add_text('独立照片查询结果文件夹', '')
+                self._button('校验并载入独立照片结果', self._load_current_query)
+            with gui.add_folder('进阶：检查并采用照片接入证据', expand_by_default=False):
+                gui.add_markdown('先在「⑤ 路线」选路线图与时间模式。**查看候选 → 导入证据 → 检查 → 明确采用**；定位成功不等于能够进入路线。')
+                self.connection_info = gui.add_text('接入检查结果（含原始证据字段）', '尚未检查接入证据。', multiline=True, disabled=True)
+                self.connection_node = gui.add_dropdown('候选接入节点（不会自动连接）', ['(none)'])
+                self._button('检查路线图与当前接入状态', self._inspect_connection)
+                self._button('仅显示所选候选节点', self._show_connection_node)
+                self.attachment_path = gui.add_text('接入证据文件（current_start / attachment JSON）', '')
+                self.attachment_source = gui.add_text('证据来源文件（核验 SHA256）', '')
+                self._button('检查导入证据（暂不采用）', self._inspect_attachment)
+                self._button('明确采用已检查证据（仅离线预览）', self._adopt_attachment)
+                gui.add_markdown('采用前需核对原始来源。哈希只能证明文件一致，不能证明轨迹实际连续；单张照片本身不能提供接入路径证据。')
+        with self._review_tab:
+            gui.add_markdown('### 审核历史轨迹是否连续\n**生成候选 → 回看原视频与参考帧 → 填依据 → 确认 / 拆分 / 拒绝 → 保存。**\n\n紫色线仍是待审核候选。这里确认的是历史采集连续性，不是现在能通行，也不会让机器狗移动。')
+            with gui.add_folder('候选生成参数', expand_by_default=False):
+                self.review_gap = gui.add_number('候选最大时间间隔（秒）', 2., min=.01, step=.1)
+            self._button('生成待审核候选路段', self._prepare_review)
+            self.review_info = gui.add_text('审核进度', '尚未生成候选路段。', multiline=True, disabled=True)
+            self.review_candidate = gui.add_dropdown('选择待审核路段', ['(none)'])
+            self.review_candidate_info = gui.add_text('所选路段概况', '暂无待审核路段。', multiline=True, disabled=True)
+            self.review_candidate.on_update(self._guard(self._select_review_candidate))
+            self.review_frame = gui.add_dropdown('回看时间线帧序号（含未注册帧）', ['(none)'])
+            self._button('查看该帧画面与时间', self._show_review_frame)
+            self.review_image = gui.add_image(np.zeros((2, 2, 3), np.uint8), label='审核参考画面', visible=False)
+            gui.add_markdown('**只确认一部分？** 先选下面的首尾帧并点击拆分，再选择拆出的路段进行确认。直接确认会确认当前整段。')
+            self.review_first = gui.add_dropdown('拆分范围：首帧', ['(none)'])
+            self.review_last = gui.add_dropdown('拆分范围：尾帧', ['(none)'])
+            self.reviewer = gui.add_text('审核人（必填）', '')
+            self.review_note = gui.add_text('审核依据 / 拆分或拒绝原因（必填）', '', multiline=True)
+            self._button('按所选范围拆分（仍待审核）', lambda _: self._review_decide('split'))
+            self._button('确认当前整段历史连续', lambda _: self._review_decide('confirm'))
+            self._button('拒绝当前整段', lambda _: self._review_decide('reject'))
+            self._button('保存审核结果并生成路线图', self._save_review)
+            with gui.add_folder('原始审核诊断（时间缺口与来源）', expand_by_default=False):
+                self.review_diagnostics = gui.add_text('来源与连续性风险记录', '', multiline=True, disabled=True)
+                self.candidate_diagnostics = gui.add_text('候选原始记录', '', multiline=True, disabled=True)
 
     def _planning_time(self):
-        mode = self.time_mode.value
+        mode = protocol_value(self.time_mode.value, TIME_MODES)
         reference = self.replay_time.value.strip() or None
         _time_context(utc_now(), mode, reference)
         return dict(time_mode=mode, replay_reference_time=reference)
@@ -100,7 +110,7 @@ class RouteWorkflowControls:
         self._pending_attachment = None
         self.controller.clear('attachment')
         self.controller.clear('connection_node')
-        self.connection_info.value = 'Connection must be inspected for this start / graph / time.'
+        self.connection_info.value = '起点、路线图或时间变化后，需要重新检查接入证据。'
 
     def _workflow_context_changed(self, _):
         self._invalidate_plan()
@@ -111,8 +121,10 @@ class RouteWorkflowControls:
         self._review_revision += 1
         self.route_review = None
         self.controller.clear('review_candidate')
-        self.review_info.value = 'Map/component changed; generate a new review.'
-        self.review_candidate_info.value = 'No pending segment'
+        self.review_info.value = '地图或分量已改变，请重新生成候选路段。'
+        self.review_candidate_info.value = '暂无待审核路段。'
+        self.review_diagnostics.value = self.candidate_diagnostics.value = ''
+        self.review_image.visible = False
         self.review_candidate.options = ['(none)']
         self.review_candidate.value = '(none)'
 
@@ -140,16 +152,16 @@ class RouteWorkflowControls:
             self.controller._keep(group, scene.add_line_segments('/'+group+'/path',
                 points=np.stack((points[:-1], points[1:]), axis=1), colors=color,
                 thickness=3., thickness_units='screen'))
-        self.controller._keep(group, scene.add_label('/'+group+'/label', text=text, position=points[0]))
+        # Keep text explanations in the panel, never across the point cloud.
 
     def _connection_report(self, report, *, adopted=False):
         fields = {k: report.get(k) for k in ('valid', 'node_id', 'evidence', 'missing', 'reasons',
                                             'time_mode', 'replay_reference_time', 'run_at')}
-        self.connection_info.value = ('ADOPTED (offline only)\n' if adopted else 'INSPECTION ONLY\n') + json.dumps(fields, ensure_ascii=False, indent=2)
+        self.connection_info.value = ('已明确采用（仅离线预览）\n' if adopted else '仅检查，未自动采用\n') + json.dumps(fields, ensure_ascii=False, indent=2)
         self.controller.clear('attachment')
         if report['valid']:
             self._draw_preview('attachment', report['path'],
-                ('ADOPTED camera connection' if adopted else 'CANDIDATE connection — not adopted')+' -> '+str(report['node_id']), (250, 175, 70))
+                ('已采用的相机接入' if adopted else '候选接入｜尚未采用')+' → '+str(report['node_id']), (250, 175, 70))
 
     def _inspect_connection(self, _):
         graph = self._read_graph()
@@ -162,8 +174,7 @@ class RouteWorkflowControls:
         node = graph['nodes'].get(self.connection_node.value)
         if not node:
             raise ValueError('select_graph_node')
-        self.controller.pose('connection_node', node['T_MC'], color=(245, 175, 75),
-                             label='Candidate node only — NO connection created')
+        self.controller.pose('connection_node', node['T_MC'], color=(245, 175, 75))
 
     def _inspect_attachment(self, _):
         self._invalidate_plan()
@@ -235,7 +246,8 @@ class RouteWorkflowControls:
         self.controller.clear('review_candidate')
         self.review_candidate.options = ['(none)']
         self.review_candidate.value = '(none)'
-        self.review_candidate_info.value = 'Generating candidates from verified inputs...'
+        self.review_candidate_info.value = '正在从已校验的输入生成候选……'
+        self.review_image.visible = False
         job = self._submit('prepare_route_review', {'max_gap_s': float(self.review_gap.value)})
         self._review_jobs[job['job_id']] = (self._review_revision, None)
 
@@ -262,7 +274,9 @@ class RouteWorkflowControls:
         info = {k: review.get(k) for k in ('source_kind', 'capture_device_kind', 'source_path', 'source_sha256', 'diagnostics', 'warnings')}
         info.update(pending=len([c for c in review['candidates'] if c['status'] == 'PENDING']),
                     confirmed_segments=len(review['route_segments']), timeline_rows=len(review['timeline']))
-        self.review_info.value = json.dumps(info, ensure_ascii=False, indent=2)[:16000]
+        self.review_diagnostics.value = json.dumps(info, ensure_ascii=False, indent=2)[:16000]
+        self.review_info.value = (f"待审核 {info['pending']} 段；已确认 {info['confirmed_segments']} 段；时间线 {info['timeline_rows']} 帧。\n"
+            '请核对原始视频中的跳切、中断及未注册帧。时间连续本身不证明实际轨迹连续。')
         self._select_review_candidate(None)
 
     def _select_review_candidate(self, _):
@@ -272,26 +286,33 @@ class RouteWorkflowControls:
         names = candidate['frame_names'] if candidate else ['(none)']
         self.review_first.options = self.review_last.options = names
         self.review_first.value, self.review_last.value = names[0], names[-1]
-        self.review_candidate_info.value = (json.dumps(candidate, ensure_ascii=False, indent=2)[:16000]
-                                            if candidate else 'No pending segment')
+        self.candidate_diagnostics.value = json.dumps(candidate, ensure_ascii=False, indent=2)[:16000] if candidate else ''
+        self.review_candidate_info.value = (f"本段 {len(names)} 帧\n首帧：{names[0]}\n尾帧：{names[-1]}\n状态：待审核，尚未作为路线边。"
+                                            if candidate else '暂无待审核路段。')
+        if candidate and candidate.get('pts_time_s'):
+            times = candidate['pts_time_s']
+            self.review_candidate_info.value += f'\n素材显示时间：{times[0]} — {times[-1]} 秒'
         if candidate and candidate['component_id'] == self.controller.model['component_id']:
             self._draw_preview('review_candidate', candidate['camera_path'],
-                               'PENDING temporal candidate — NOT approved route', (185, 100, 230))
+                               '待审核历史路段｜尚未确认连续', (185, 100, 230))
 
     def _show_review_frame(self, _):
         if not self.route_review or self.review_frame.value == '(none)':
             raise ValueError('no_review_timeline')
         row = self.route_review['timeline'][int(self.review_frame.value)]
-        self.review_info.value = json.dumps(row, ensure_ascii=False, indent=2)
+        self.review_diagnostics.value = json.dumps(row, ensure_ascii=False, indent=2)
+        self.review_info.value = (f"正在回看第 {self.review_frame.value} 行；帧名：{row.get('frame_name', '未知')}\n"
+            f"素材显示时间：{row.get('pts_time_s', '未知')} 秒；{'已注册' if row.get('registered') else '未注册'}\n"
+            '风险与来源详见原始审核诊断；显示时间不等于传感器曝光时间。')
         name = row.get('frame_name')
         camera = next((c for c in self.controller.model['cameras'] if c['name'] == name), None)
-        self.reference_image.visible = False
+        self.review_image.visible = False
         if camera and camera.get('image_path'):
             from .viser_viewer import _read_image
-            self.reference_image.image = _read_image(camera['image_path'])
-            self.reference_image.visible = True
+            self.review_image.image = _read_image(camera['image_path'])
+            self.review_image.visible = True
         else:
-            self.review_info.value += '\nImage unavailable in this component; review original video at this PTS.'
+            self.review_info.value += '\n当前分量没有该图像，请按记录的显示时间回看原视频。'
 
     def _review_decide(self, decision):
         self._require_final()

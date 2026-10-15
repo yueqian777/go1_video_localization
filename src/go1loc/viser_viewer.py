@@ -19,6 +19,7 @@ import numpy as np
 
 from .jobs import JobManager, atomic_json, ensure_sidecar, read_json, utc_now
 from .viewer_workflows import RouteWorkflowControls
+from .viewer_text import VIEW_MODES, human_status, protocol_value, save_uploaded_image
 
 POINT_BUDGET = 50000
 PHOTO_PLANE_Z = 10000.0
@@ -229,9 +230,6 @@ class SceneController:
                     scale=.16, color=(85, 155, 245)))
                 h.on_click(lambda event, c=camera: self.on_reference_click(event, c)
                            if self.on_reference_click else None)
-            self._keep('model', scene.add_label('/model/label', text=(
-                'BUILD SNAPSHOT — final-map alignment unknown' if self.mode == 'build_snapshot'
-                else 'FINAL MAP REPLAY — not live reconstruction'), position=(0, 0, 0)))
 
     @_scene_locked
     def on_client_connect(self, client):
@@ -240,12 +238,14 @@ class SceneController:
         return deepcopy(self.model) if self.model else {}
 
     @_scene_locked
-    def pose(self, group, value, *, color, label):
+    def pose(self, group, value, *, color, label=None):
+        # The workbench omits labels; explicit API callers can still request one.
         T, q = _pose(value)
         self.clear(group)
         self._keep(group, self.server.scene.add_camera_frustum('/'+group+'/camera', fov=.8,
                    aspect=1.5, scale=.25, wxyz=q, position=T[:3, 3], color=color))
-        self._keep(group, self.server.scene.add_label('/'+group+'/label', text=label, position=T[:3, 3]))
+        if label:
+            self._keep(group, self.server.scene.add_label('/'+group+'/label', text=label, position=T[:3, 3]))
 
     @_scene_locked
     def load_query(self, payload, *, current=False):
@@ -256,8 +256,7 @@ class SceneController:
         _identity(payload, self.model)
         if payload.get('pose_status') != 'localized' or payload.get('T_WC_query') is None:
             raise ValueError('query_not_localized')
-        self.pose(group, payload['T_WC_query'], color=(255, 165, 0) if current else (230, 80, 240),
-                  label='CURRENT CAMERA (capture time required)' if current else 'TARGET PHOTO CAMERA (not current)')
+        self.pose(group, payload['T_WC_query'], color=(255, 165, 0) if current else (230, 80, 240))
 
     @_scene_locked
     def load_object(self, payload, evidence):
@@ -275,9 +274,6 @@ class SceneController:
         if support:
             self._keep('support', self.server.scene.add_point_cloud('/support/points',
                        points=_points(list(support.values())), colors=(255, 210, 40), point_size=.065))
-        if payload.get('object_surface_position') is not None:
-            self._keep('support', self.server.scene.add_label('/support/label',
-                text='Visible surface support — NOT full object center', position=payload['object_surface_position']))
         # Observing reference cameras are candidate goals, never the object centroid.
         names = set(payload.get('supporting_frame_ids', []))
         for i, c in enumerate(self.model['cameras']):
@@ -295,12 +291,10 @@ class SceneController:
             self._keep('route', self.server.scene.add_line_segments('/route/path',
                 points=np.stack((path[:-1], path[1:]), axis=1), colors=(30, 225, 220),
                 thickness=3., thickness_units='screen'))
-        self._keep('route', self.server.scene.add_label('/route/label',
-            text='CAMERA ROUTE PREVIEW ONLY — execution_permitted=false; '+payload['units'], position=path[0]))
         if payload.get('start_camera_pose') is not None:
-            self.pose('start', payload['start_camera_pose'], color=(255, 165, 0), label='Plan start: '+str(payload.get('start_source')))
+            self.pose('start', payload['start_camera_pose'], color=(255, 165, 0))
         if payload.get('goal_observation_pose') is not None:
-            self.pose('goal', payload['goal_observation_pose'], color=(80, 230, 110), label='Goal observation camera')
+            self.pose('goal', payload['goal_observation_pose'], color=(80, 230, 110))
 
 
 def _app_locked(method):
@@ -324,7 +318,7 @@ class ViewerApplication(RouteWorkflowControls):
                 import viser
             except ImportError as exc:
                 raise RuntimeError('Optional UI missing: install viser==1.1.1 in the project runtime') from exc
-            server = viser.ViserServer(host='127.0.0.1', port=port, label='Go1 offline evidence viewer')
+            server = viser.ViserServer(host='127.0.0.1', port=port, label='Go1 地图与照片定位工作台')
         self.server = server
         self._state_lock = threading.RLock()
         self._task_revision = 0
@@ -351,12 +345,15 @@ class ViewerApplication(RouteWorkflowControls):
 
     def _message(self, text):
         self.status.value = str(text)[:8000]
+        self.notice.value = human_status(text)
+        self._refresh_overview()
 
     def _guard(self, callback):
         def guarded(event):
             try:
                 with self._state_lock:
                     callback(event)
+                    self._refresh_overview()
             except Exception as exc:
                 self._message(f'{type(exc).__name__}: {exc}')
         return guarded
@@ -368,46 +365,113 @@ class ViewerApplication(RouteWorkflowControls):
 
     def _ui(self):
         gui = self.server.gui
-        gui.add_markdown('## Go1 offline evidence viewer\nLocalhost only. No robot controls.\n'
-                         'Historical camera routes are previews, not clearance or walking commands.')
-        self.status = gui.add_text('Status / counts / errors', 'Loading frozen map in worker...', multiline=True, disabled=True)
-        self.mode = gui.add_dropdown('View mode', ['final_map_replay', 'build_snapshot'])
-        self.component = gui.add_text('Component ID (blank = first)', '')
-        self.snapshot_index = gui.add_number('Snapshot list index (-1 = latest)', -1, step=1, min=-1)
-        self._button('Load selected mode / component', self._load_mode)
-        self.frame = gui.add_dropdown('Reference frame / real PTS', ['(loading)'])
-        self._button('Show reference photo and pose', self._show_frame)
-        self.reference_image = gui.add_image(np.zeros((2, 2, 3), np.uint8), label='Reference photo', visible=False)
-        gui.add_markdown('Final replay shows the FINAL cloud at all times; selecting keyframes does not pretend to reconstruct it.')
-        self.photo = gui.add_text('Target raw photo path', '')
-        self._button('Open raw photo for visual ROI (Shift + drag)', self._open_photo)
-        self.roi_min = gui.add_vector2('ROI top-left raw pixels', (0., 0.))
-        self.roi_max = gui.add_vector2('ROI bottom-right raw pixels', (1., 1.))
-        self.query_path = gui.add_text('Saved query directory (optional reuse)', str(self._pending_query or ''))
-        self._button('Load saved query pose / evidence', lambda _: self.load_query(Path(self.query_path.value)))
-        self.mask_path = gui.add_text('Original-size mask path (optional)', '')
-        self.cluster_radius = gui.add_number('Cluster radius map_units (0 = automatic)', 0., min=0., step=.05)
-        self.minimum_points = gui.add_number('Minimum support points', 3, min=3, max=1000, step=1)
-        self.camera_model = gui.add_text('Query camera model (optional)', '')
-        self.camera_params = gui.add_text('Query camera params JSON (optional)', '')
-        self.calibration = gui.add_text('Query calibration path (optional)', '')
-        self._button('Compute photo ROI -> 3D support', self._locate_object)
-        self.object_path = gui.add_text('Saved object_result JSON path', '')
-        self._button('Load saved object support', lambda _: self.load_object(Path(self.object_path.value)))
-        self.evidence_image = gui.add_image(np.zeros((2, 2, 3), np.uint8), label='Measured matches: green=inlier, red=rejected', visible=False)
-        self._button('Return to 3D map', self._return_map)
-        self.current_photo = gui.add_text('INDEPENDENT current photo path', '')
-        self.capture_time = gui.add_text('Actual capture time ISO8601 + timezone', '',
-            hint='Required; never auto-filled with localization time. Old photos are not current.')
-        self._button('Localize independent current photo', self._localize_current)
-        self._button('Use selected reference as MANUAL start', self._manual_start)
-        self.graph_path = gui.add_text('Verified route_graph JSON path', '')
+        gui.configure_theme(control_width='large', show_share_button=False, brand_color=(31, 116, 151))
+        gui.add_markdown('## Go1 地图与照片定位\n**离线研究工作台 · 不会控制机器狗**')
+        self.notice = gui.add_text('当前提示', '正在读取地图，请稍候。', multiline=True, disabled=True)
+        self.overview = gui.add_markdown('地图载入后显示任务进度。')
+        self._button('恢复地图总览', self._return_map)
+        with gui.add_folder('新手先看：图中是什么？', expand_by_default=False):
+            gui.add_markdown('**散点**：从多张照片估计的三维特征，不是完整墙面；没有点不代表没有障碍。\n\n'
+                '**蓝色线框**：历史相机位置和朝向；**黄色点**：目标表面证据；**绿色相机**：目标观察位置。\n\n'
+                '**紫色线**：待审核历史路段；**青色线**：通过证据检查的离线路线预览。\n\n'
+                '鼠标拖动旋转，滚轮缩放。视角迷路时点击「恢复地图总览」。没有米制尺度时使用地图单位，不当作米。')
+        tabs = gui.add_tab_group()
+        self._map_tab, self._object_tab, self._start_tab, self._review_tab, self._plan_tab = [
+            tabs.add_tab(name) for name in ['① 地图', '② 找物', '③ 起点', '④ 路段', '⑤ 路线']]
+        with self._map_tab:
+            gui.add_markdown('### 回看环境与拍摄位置\n先选模式再加载。最终地图回看不是实时建图；过程快照是建图时保存的完整阶段结果，与最终地图的对齐关系未知。')
+            self.mode = gui.add_dropdown('查看内容', list(VIEW_MODES))
+            self.snapshot_index = gui.add_number('快照序号（0 起；-1 为最新）', -1, step=1, min=-1,
+                hint='仅在「建图过程快照」模式使用；需要启动时已指定快照目录。')
+            with gui.add_folder('高级：地图分量', expand_by_default=False):
+                self.component = gui.add_text('分量编号（留空使用第一个）', '')
+            self._button('加载所选地图或快照', self._load_mode)
+            self.frame = gui.add_dropdown('选择历史参考帧', ['（正在载入）'])
+            self.follow_reference = gui.add_checkbox('同时进入该相机视角（可选）', False)
+            self._button('查看参考照片与拍摄位置', self._show_frame)
+            self.reference_image = gui.add_image(np.zeros((2, 2, 3), np.uint8), label='历史参考照片（不是实时画面）', visible=False)
+            self.reference_info = gui.add_text('所选参考帧信息', '请选择参考帧并点击查看。', multiline=True, disabled=True)
+            gui.add_markdown('参考帧的时间是素材记录时间。屏幕录制的显示时间不等于传感器曝光时间。')
+        with self._object_tab:
+            gui.add_markdown('### 用独立照片寻找物体\n**选照片 → 打开原图 → Shift 拖动框选 → 计算。**\n\n'
+                '正式验证请使用未参与建图的独立采集照片。输出是可见表面的三维支持点，不是自动识别出的完整物体。')
+            self.photo = gui.add_text('目标原图路径', '')
+            self._photo_upload('选择目标照片', self.photo)
+            self._button('打开原图并框选目标', self._open_photo)
+            with gui.add_folder('框选坐标（原图像素，可手动调整）', expand_by_default=False):
+                self.roi_min = gui.add_vector2('左上角 x / y', (0., 0.))
+                self.roi_max = gui.add_vector2('右下角 x / y', (1., 1.))
+            self._button('计算目标位置与证据', self._locate_object)
+            self.evidence_image = gui.add_image(np.zeros((2, 2, 3), np.uint8), label='匹配证据：绿色通过，红色排除', visible=False)
+            with gui.add_folder('复用已有查询或目标结果', expand_by_default=False):
+                self.query_path = gui.add_text('查询结果文件夹', str(self._pending_query or ''))
+                self._button('载入已有照片定位证据', lambda _: self.load_query(Path(self.query_path.value)))
+                self.object_path = gui.add_text('目标结果文件（object_result.json）', '')
+                self._button('载入已有目标支持点', lambda _: self.load_object(Path(self.object_path.value)))
+            with gui.add_folder('高级：掩膜、标定与支持点参数', expand_by_default=False):
+                gui.add_markdown('没有可靠标定时请留空，不编造内参、不重复去畸变。此处标定参数也供独立当前照片使用。')
+                self.mask_path = gui.add_text('原尺寸特征排除掩膜（可选）', '')
+                self.cluster_radius = gui.add_number('聚类半径（地图单位；0 自动）', 0., min=0., step=.05)
+                self.minimum_points = gui.add_number('最少支持点数', 3, min=3, max=1000, step=1)
+                self.camera_model = gui.add_text('相机模型（可选，如 PINHOLE）', '')
+                self.camera_params = gui.add_text('相机内参 JSON 数组（可选）', '')
+                self.calibration = gui.add_text('标定文件路径（可选）', '')
+        with self._start_tab:
+            gui.add_markdown('### 路线从哪里出发？\n**入门方法：人工历史起点。** 在「① 地图」选择参考帧，再点下面按钮。它不是机器狗的实时位置。')
+            self._button('将选中参考帧设为人工起点', self._manual_start)
+            with gui.add_folder('进阶：定位独立当前照片', expand_by_default=False):
+                gui.add_markdown('目标照片不能冒充当前位置。照片定位后仍需合法接入证据，不会自动吸附最近节点。')
+                self.current_photo = gui.add_text('独立当前照片路径', '')
+                self._photo_upload('选择独立当前照片', self.current_photo)
+                self.capture_time = gui.add_text('真实拍摄时间（含时区）', '',
+                    hint='格式如 2026-10-14T12:00:00+08:00。示例不是你的采集时间；未知时不能编造。')
+                self._button('定位独立当前照片', self._localize_current)
+        with self._plan_tab:
+            gui.add_markdown('### 检查准备情况并预览路线\n需要：已支持的目标、明确起点、已审核路线图。独立照片起点还需要合法接入证据。\n\n'
+                '**终点是能观察目标的参考相机位置，不是物体中心。所有结果禁止直接用于机器人执行。**')
+            self.graph_path = gui.add_text('已审核路线图文件', '', hint='在「④ 路段」保存后自动填入；也可填已有 route_graph.json。')
+            self._button('计算离线路线预览', self._plan_route)
+            self._button('导出当前路线结果', self._save_plan)
+            with gui.add_folder('载入已有路线结果', expand_by_default=False):
+                self.plan_path = gui.add_text('路线结果文件（planning_result.json）', '')
+                self._button('校验并载入已有路线', self._load_plan)
         self._workflow_ui()
-        self._button('Compute route preview from start + target', self._plan_route)
-        self.plan_path = gui.add_text('Saved planning_result JSON path', '')
-        self._button('Load route preview JSON', self._load_plan)
-        self._button('Save displayed planning JSON to sidecar', self._save_plan)
-        self._button('Save screenshot to sidecar', self._screenshot)
+        with gui.add_folder('导出与诊断详情', expand_by_default=False):
+            self._button('保存三维画布截图', self._screenshot)
+            gui.add_markdown('截图仅包含三维画布，不包含面板。下方保留原始英文错误码和文件位置，便于复核。')
+            self.status = gui.add_text('原始诊断记录', '', multiline=True, disabled=True)
+            gui.add_text('当前地图目录', str(self.map_dir), disabled=True)
+            gui.add_text('结果保存目录', str(self.sidecar), disabled=True)
+
+    def _photo_upload(self, label, field):
+        button = self.server.gui.add_upload_button(label, mime_type='image/png,image/jpeg',
+            hint='仅复制到本机工作目录；原文件不改动，不上传云端。最大 32 MiB。')
+        def received(event):
+            upload = event.target.value
+            if upload is None:
+                return
+            path = save_uploaded_image(self.sidecar, upload.name, upload.content)
+            if field is self.photo:
+                self._invalidate_target(clear_query=True)
+                self._query_selected = True
+            elif field is self.current_photo:
+                self._task_revision += 1
+                self.current_start = None
+                self.controller.clear('start')
+                self._invalidate_plan()
+                self._clear_connection_preview()
+            field.value = str(path)
+            self._message('照片已复制到本地工作目录，原始字节保持不变。请继续打开原图或填写真实拍摄时间。')
+        button.on_upload(self._guard(received))
+
+    def _refresh_overview(self):
+        model = self.controller.model
+        map_state = ('最终地图已加载' if self.controller.mode == 'final_map_replay' else '过程快照（仅查看）') if model else '地图待加载'
+        target = '目标已有支持点' if (self.target_result or {}).get('status') == 'supported' else '目标待求解'
+        start = ('人工历史起点' if self.current_start.get('manual') else '独立照片起点') if self.current_start else '起点待设置'
+        review = getattr(self, 'route_review', None) or {}
+        segments = len(review.get('route_segments', []))
+        self.overview.content = f'**{map_state}** · {target} · {start}\n\n已确认历史路段：{segments} 段（不等于当前可通行）'
 
     def _submit(self, kind, params, role=None):
         job = self.jobs.submit(kind, params)
@@ -451,6 +515,8 @@ class ViewerApplication(RouteWorkflowControls):
             self._invalidate_target(clear_query=True)
             self._query_selected = False
             self.controller.replace_model(payload)
+            self.reference_image.visible = False
+            self.reference_info.value = '地图已切换，请重新选择参考帧。'
             self._reset_workflows()
             self.plan_result = self.current_start = None
             self.target_result = None
@@ -531,10 +597,14 @@ class ViewerApplication(RouteWorkflowControls):
 
     def _show_frame(self, event):
         camera = self._reference()
+        self.controller.pose('reference', camera['T_WC'], color=(240, 125, 235))
+        pts = camera.get('pts_time_s')
+        self.reference_info.value = f"帧：{camera['name']}\n素材显示时间：{pts if pts is not None else '未知'} 秒\n该位置是历史拍摄位置，不是当前实测位置。"
+        self.reference_image.visible = False
         if camera.get('image_path') and Path(camera['image_path']).is_file():
             self.reference_image.image = _read_image(camera['image_path'])
             self.reference_image.visible = True
-        if event.client:
+        if event.client and self.follow_reference.value:
             T, q = _pose(camera['T_WC'])
             event.client.camera.position = T[:3, 3]
             event.client.camera.wxyz = q
@@ -543,7 +613,7 @@ class ViewerApplication(RouteWorkflowControls):
                       f"mode={self.controller.mode}. Reference camera is NOT current pose.")
 
     def _load_mode(self, _):
-        if self.mode.value == 'build_snapshot':
+        if protocol_value(self.mode.value, VIEW_MODES) == 'build_snapshot':
             if not self.snapshot_dir:
                 raise ValueError('no_ready_snapshot: snapshot directory not supplied')
             # Worker validates READY and all native hashes, never a live model.
@@ -741,7 +811,7 @@ class ViewerApplication(RouteWorkflowControls):
         self.current_start = {k: self.controller.model[k] for k in ('map_id', 'map_hash', 'component_id')}
         self.current_start.update(source='explicit_pose', manual=True, node_id=camera['name'],
                                   T_MC=camera['T_WC'], selected_at=utc_now())
-        self.controller.pose('start', camera['T_WC'], color=(255, 165, 0), label='MANUAL camera start — not measured current pose')
+        self.controller.pose('start', camera['T_WC'], color=(255, 165, 0))
         path = self.sidecar/('manual_start-'+uuid4().hex+'.json')
         atomic_json(path, self.current_start)
         self._message('Saved explicitly MANUAL start: '+str(path))

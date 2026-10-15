@@ -30,6 +30,7 @@ class BuildViewerTests(unittest.TestCase):
         self.assertFalse(app.jobs.submitted)
         app.tick()
         self.assertIn('features', app.status.value)
+        self.assertIn('特征提取', app.status.value)
         self.state['snapshots'] = [{'snapshot_index': 1, 'component_id': 'attempt1'}]
         app.tick()
         self.assertEqual(app.jobs.submitted[-1][0], 'inspect_build_snapshot')

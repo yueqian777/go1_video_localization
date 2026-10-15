@@ -24,7 +24,7 @@ class BuildWatchApplication:
             raise ValueError('invalid_port')
         if server is None:
             import viser
-            server = viser.ViserServer(host='127.0.0.1', port=port, label='First-build monitor')
+            server = viser.ViserServer(host='127.0.0.1', port=port, label='Go1 首次建图监看')
         self.server = server
         self.controller = SceneController(server)
         self.jobs = JobManager(self.map_dir, self.sidecar)
@@ -38,16 +38,19 @@ class BuildWatchApplication:
         self._following = True
         self.state = initial
         gui = server.gui
-        gui.add_markdown('## First-build monitor\nNo frozen map is needed. Only READY snapshots are loaded.\n'
-                         'No queries, routes, robot connections or movement controls in this window.')
-        self.status = gui.add_text('Build stage / events / failure', 'Waiting for snapshots', multiline=True, disabled=True)
-        self.display = gui.add_text('Displayed model', 'No complete snapshot yet', multiline=True, disabled=True)
-        self.follow = gui.add_checkbox('Automatically follow latest snapshot / final map', True)
+        gui.configure_theme(control_width='large', show_share_button=False, brand_color=(31, 116, 151))
+        gui.add_markdown('## 首次建图监看\n不需要最终地图。只读取已完整发布、通过校验的真实快照。\n\n'
+                         '**勾选自动跟随**：跟随最新快照，完成后切到冻结地图。\n\n'
+                         '**查看历史**：选择序号并暂停跟随。建图失败仍保留已有快照。\n\n'
+                         '本窗口不连接机器狗，没有运动控制，也不把未对齐的查询或路线叠加到快照。')
+        self.status = gui.add_text('建图阶段与事件（保留原始代码）', '等待完整快照。', multiline=True, disabled=True)
+        self.display = gui.add_text('当前显示的模型', '尚无完整快照。', multiline=True, disabled=True)
+        self.follow = gui.add_checkbox('自动跟随最新快照与最终地图', True)
         self.follow.on_update(self._guard(self._follow_changed))
-        self.snapshot = gui.add_dropdown('History snapshot index', ['(none)'])
-        self._button('Pause and load selected history', self.load_history)
-        self._button('Load completed frozen map', self.load_final)
-        self._button('Save 3D canvas screenshot', self.screenshot)
+        self.snapshot = gui.add_dropdown('选择历史快照序号', ['(none)'])
+        self._button('暂停跟随并查看所选快照', self.load_history)
+        self._button('加载已完成的冻结地图', self.load_final)
+        self._button('保存三维画布截图', self.screenshot)
         server.on_client_connect(self._connect)
         self.records.emit('watch_started', data={'frozen_manifest_exists': (self.map_dir/'map_manifest.json').exists(),
                                                 'run_dir': str(self.run_dir)})
@@ -100,8 +103,11 @@ class BuildWatchApplication:
             self.state = read_build_state(self.run_dir)
             state = self.state
             events = state.get('events', [])
-            self.status.value = (f"{state['status']} | stage={state.get('stage')} | "
-                f"READY snapshots={len(state['snapshots'])} | last event={events[-1].get('sequence') if events else 'none'}\n"
+            stage = state.get('stage')
+            phase = {'features': '特征提取', 'extraction': '特征提取', 'matching': '图像匹配', 'mapping': '三维重建', 'prepare': '准备输入'}.get(stage, '阶段详见原始代码')
+            status = {'running': '进行中', 'completed': '已完成', 'failed': '失败（保留已有快照）', 'cancelled': '已取消'}.get(state['status'], '等待')
+            self.status.value = (f"{status} | {phase}（{stage}） | "
+                f"完整快照 {len(state['snapshots'])} 份 | 最近事件 {events[-1].get('sequence') if events else '无'}\n"
                 f"{state.get('failure_reason') or ''}\nrun={self.run_dir}")
             options = [str(s['snapshot_index']) for s in state['snapshots']] or ['(none)']
             if list(self.snapshot.options) != options:
@@ -134,13 +140,13 @@ class BuildWatchApplication:
             return
         self._last_key = key
         if state['status'] == 'failed':
-            self.display.value = 'Display job failed (last complete model retained): '+state.get('error', '')
+            self.display.value = '模型读取失败；上一份完整模型保留。原始原因：'+state.get('error', '')
             self.records.emit('display_failed', data={'error': state.get('error'), 'selection': key})
             return
         payload = read_json(state['result_path'])
         self.controller.replace_model(payload)
-        self.display.value = (f"{payload['mode']} | {len(payload['cameras'])} cameras | {payload['total_points']} points\n"
-                              f"{payload['component_id']} | snapshot/final alignment is NOT assumed")
+        self.display.value = (f"{'最终地图' if payload['mode'] == 'final_map_replay' else '真实过程快照'} | {len(payload['cameras'])} 个相机位姿 | {payload['total_points']} 个点\n"
+                              f"分量：{payload['component_id']} | 不假定快照与最终地图已对齐")
         self.records.emit('display_loaded', component_id=payload['component_id'],
                           registered_images=len(payload['cameras']), points3D=payload['total_points'],
                           data={'mode': payload['mode'], 'revision': payload['revision'],
@@ -175,7 +181,7 @@ class BuildWatchApplication:
         from PIL import Image
         path = self.sidecar/('screenshot-'+uuid4().hex+'.png')
         Image.fromarray(event.client.get_render(height=720, width=1280, timeout=15.)).save(path)
-        self.display.value = 'Saved 3D canvas: '+str(path)
+        self.display.value = '三维画布截图已保存：'+str(path)
 
     def _poll(self):
         while not self._stop.is_set():
