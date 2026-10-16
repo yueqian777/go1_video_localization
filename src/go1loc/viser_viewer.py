@@ -25,6 +25,7 @@ from .playback import PlaybackControls
 from .build_guide import BuildGuideControls
 from .web_build_ui import WebBuildControls
 from .photo_selection import PhotoSelectionControls, PHOTO_PLANE_Z
+from .navigation_ui import NavigationControls
 
 POINT_BUDGET = 50000
 
@@ -309,7 +310,7 @@ def _app_locked(method):
     return locked
 
 
-class ViewerApplication(PhotoSelectionControls, RouteWorkflowControls, PlaybackControls, BuildGuideControls, WebBuildControls):
+class ViewerApplication(NavigationControls, PhotoSelectionControls, RouteWorkflowControls, PlaybackControls, BuildGuideControls, WebBuildControls):
     def __init__(self, map_dir, sidecar_dir, *, port=8765, query_dir=None, snapshot_dir=None, server=None):
         self.map_dir = Path(map_dir).resolve()
         self.sidecar = ensure_sidecar(self.map_dir, sidecar_dir)
@@ -371,17 +372,21 @@ class ViewerApplication(PhotoSelectionControls, RouteWorkflowControls, PlaybackC
     def _ui(self):
         gui = self.server.gui
         gui.configure_theme(control_width='large', show_share_button=False, brand_color=(31, 116, 151))
-        gui.add_markdown('## Go1 地图与照片定位\n**离线研究工作台 · 不会控制机器狗**')
+        gui.add_markdown('## Go1 地图与照片定位\n**视觉方向引导 · 不会控制机器狗**')
         self.notice = gui.add_text('当前提示', '正在读取地图，请稍候。', multiline=True, disabled=True)
         self.overview = gui.add_markdown('地图载入后显示任务进度。')
         self._button('恢复地图总览', self._return_map)
         self._web_build_ui()
+        self.navigation_panel = gui.add_folder('开始找物与方向引导', expand_by_default=True)
+        self.research_mode = gui.add_checkbox('显示研究模式与旧流程（人工起点、逐段审核、证据导入）', False)
         with gui.add_folder('新手先看：图中是什么？', expand_by_default=False):
             gui.add_markdown('**散点**：从多张照片估计的三维特征，不是完整墙面；没有点不代表没有障碍。\n\n'
                 '**蓝色线框**：历史相机位置和朝向；**黄色点**：目标表面证据；**绿色相机**：目标观察位置。\n\n'
                 '**紫色线**：待审核历史路段；**青色线**：通过证据检查的离线路线预览。\n\n'
                 '鼠标拖动旋转，滚轮缩放。视角迷路时点击「恢复地图总览」。没有米制尺度时使用地图单位，不当作米。')
         tabs = gui.add_tab_group()
+        tabs.visible = False
+        self.research_mode.on_update(self._guard(lambda _: setattr(tabs, 'visible', self.research_mode.value)))
         self._map_tab, self._object_tab, self._start_tab, self._review_tab, self._plan_tab = [
             tabs.add_tab(name) for name in ['① 地图', '② 找物', '③ 起点', '④ 路段', '⑤ 路线']]
         with self._map_tab:
@@ -465,6 +470,7 @@ class ViewerApplication(PhotoSelectionControls, RouteWorkflowControls, PlaybackC
             self.status = gui.add_text('原始诊断记录', '', multiline=True, disabled=True)
             self.map_directory = gui.add_text('当前地图目录', str(self.map_dir), disabled=True)
             self.results_directory = gui.add_text('结果保存目录', str(self.sidecar), disabled=True)
+        self._navigation_ui()
 
     def _photo_upload(self, label, field):
         button = self.server.gui.add_upload_button(label, mime_type='image/png,image/jpeg',
@@ -492,6 +498,9 @@ class ViewerApplication(PhotoSelectionControls, RouteWorkflowControls, PlaybackC
         model = self.controller.model
         map_state = ('最终地图已加载' if self.controller.mode == 'final_map_replay' else '过程快照（仅查看）') if model else '地图待加载'
         target = '目标已有支持点' if (self.target_result or {}).get('status') == 'supported' else '目标待求解'
+        if hasattr(self, 'research_mode') and not self.research_mode.value:
+            self.overview.content = f'{map_state} · {target}\n\n默认使用自动路线关联，不要求人工选起点或逐段审核。'
+            return
         start = ('人工历史起点' if self.current_start.get('manual') else '独立照片起点') if self.current_start else '起点待设置'
         review = getattr(self, 'route_review', None) or {}
         segments = len(review.get('route_segments', []))
@@ -525,6 +534,7 @@ class ViewerApplication(PhotoSelectionControls, RouteWorkflowControls, PlaybackC
                         elif state['status'] == 'running':
                             self._message(f"Running {state['kind']}; pid={state.get('worker_pid')}; job={job_id}")
                     self._web_tick()
+                    self._nav_tick()
             except Exception as exc:
                 self._message(f'{type(exc).__name__}: {exc}')
             self._stop.wait(.5)
@@ -554,6 +564,8 @@ class ViewerApplication(PhotoSelectionControls, RouteWorkflowControls, PlaybackC
             self.frame.options = [c['name'] for c in payload['cameras']] or ['(no frames)']
             self.frame.value = self.frame.options[0]
             self._reset_playback(payload)
+            if payload['mode'] == 'final_map_replay':
+                self._nav_map_loaded()
             for client in self.server.get_clients().values():
                 self._focus_map(client)
             self._message(f"{payload['mode']} | {len(payload['cameras'])} cameras | "
@@ -690,6 +702,7 @@ class ViewerApplication(PhotoSelectionControls, RouteWorkflowControls, PlaybackC
             self.route_summary.value = '输入已变化，请重新计算路线。'
 
     def _invalidate_target(self, *, clear_query=False):
+        self._nav_invalidate()
         self._invalidate_plan()
         self._clear_connection_preview()
         self.target_result = None
@@ -929,6 +942,7 @@ class ViewerApplication(PhotoSelectionControls, RouteWorkflowControls, PlaybackC
         self._message('Saved 3D canvas screenshot (not sidebar): '+str(path))
 
     def close(self):
+        self._nav_invalidate()
         self._stop.set()
         self._thread.join(timeout=2)
         self._playback_thread.join(timeout=2)

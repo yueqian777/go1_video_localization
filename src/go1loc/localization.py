@@ -75,7 +75,8 @@ def _save_result(output_dir: Path, result: LocalizationResult) -> LocalizationRe
     return result
 
 
-def localize_photo(query_path: Path, map_dir: Path, output_dir: Path, config: LocalizationConfig | None = None) -> LocalizationResult:
+def localize_photo(query_path: Path, map_dir: Path, output_dir: Path, config: LocalizationConfig | None = None,
+                   *, resident=None, reference_names=None) -> LocalizationResult:
     total_started = time.perf_counter()
     config = config or LocalizationConfig()
     query_path = query_path.resolve()
@@ -94,7 +95,7 @@ def localize_photo(query_path: Path, map_dir: Path, output_dir: Path, config: Lo
     manifest_path = map_dir / "map_manifest.json"
     if not manifest_path.exists():
         return _save_result(output_dir, LocalizationResult.failure(query_id=query_path.name, map_id=map_dir.name, reason="invalid_map_manifest"))
-    manifest = verify_map(map_dir)
+    manifest = resident.verified_manifest(map_dir) if resident else verify_map(map_dir)
     map_id = str(manifest.get("map_id", map_dir.name))
     if not bool(manifest.get("frozen")) and not config.allow_map_update:
         return _save_result(output_dir, LocalizationResult.failure(query_id=query_path.name, map_id=map_id, reason="map_readonly"))
@@ -108,7 +109,7 @@ def localize_photo(query_path: Path, map_dir: Path, output_dir: Path, config: Lo
     os.environ.setdefault("TORCH_HOME", str(project_root / ".models" / "torch"))
     pycolmap, extract_features, localize_sfm, match_features, pairs_from_retrieval = _require_backend()
     model_dir = resolve_map_path(map_dir, manifest['model_dir'])
-    model = pycolmap.Reconstruction(model_dir)
+    model = resident.reconstruction if resident else pycolmap.Reconstruction(model_dir)
     ref_image_names = [image.name for image in model.images.values()]
     if not ref_image_names:
         return _save_result(output_dir, LocalizationResult.failure(query_id=query_path.name, map_id=map_id, reason="insufficient_empty_map"))
@@ -116,12 +117,13 @@ def localize_photo(query_path: Path, map_dir: Path, output_dir: Path, config: Lo
     query_workspace = output_dir / "query_workspace"
     query_workspace.mkdir(parents=True, exist_ok=True)
     query_copy, geometry, rectification = prepare_query(query_path, query_workspace, config.calibration_path)
-    if screen_binding:
-        geometry['screen_observation'] = screen_binding
+    if screen_binding or resident:
+        if screen_binding:
+            geometry['screen_observation'] = screen_binding
         # Independent imports often both start at frame_00000000.png. Give hloc
         # a unique internal key without changing the original observation hash.
         from .video import sha256_file
-        unique_copy = query_copy.with_name('screen_query_'+sha256_file(query_path)[:24]+'.png')
+        unique_copy = query_copy.with_name('observation_'+sha256_file(query_path)[:24]+query_copy.suffix)
         query_copy.rename(unique_copy)
         query_copy = unique_copy
     geometry['intrinsics_request'] = {'model': config.query_camera_model,
@@ -143,20 +145,23 @@ def localize_photo(query_path: Path, map_dir: Path, output_dir: Path, config: Lo
     query_stage = _ascii_stage(query_workspace, [query_name])
     query_image_dir = query_stage or query_workspace
     try:
-        if db_global:
+        if reference_names is not None:
+            selected = [n for n in reference_names if n in ref_image_names and n != query_name]
+            query_pairs.write_text(''.join(f'{query_name} {n}\n' for n in selected), encoding='utf-8')
+        elif db_global:
             retrieval_conf = extract_features.confs["netvlad"]
-            extract_features.main(retrieval_conf, query_image_dir, output_dir, image_list=[query_name], feature_path=global_query, overwrite=True)
+            (resident.extract if resident else extract_features.main)(retrieval_conf, query_image_dir, output_dir, image_list=[query_name], feature_path=global_query, overwrite=True)
             pairs_from_retrieval.main(global_query, query_pairs, config.top_k, query_list=[query_name], db_model=model_dir, db_descriptors=db_global)
         else:
             query_pairs.write_text("".join(f"{query_name} {name}\n" for name in ref_image_names if name != query_name), encoding="utf-8")
-        extract_features.main(local_conf, query_image_dir, output_dir, image_list=[query_name], feature_path=local_query, overwrite=True)
+        (resident.extract if resident else extract_features.main)(local_conf, query_image_dir, output_dir, image_list=[query_name], feature_path=local_query, overwrite=True)
     finally:
         if query_stage:
             shutil.rmtree(query_stage, ignore_errors=True)
     if screen_binding:
         filter_features(local_query, {query_name: read_mask(Path(screen_binding['mask_path']))},
                         image_paths={query_name: query_copy}, diagnostics_dir=output_dir/'mask_diagnostics')
-    match_features.main(matcher_conf, query_pairs, features=local_query, features_ref=db_local, matches=query_matches, overwrite=True)
+    (resident.match if resident else match_features.main)(matcher_conf, query_pairs, features=local_query, features_ref=db_local, matches=query_matches, overwrite=True)
     if config.query_camera_model or rectification is not None:
         try:
             from PIL import Image
