@@ -23,9 +23,9 @@ from .viewer_text import VIEW_MODES, human_status, protocol_value, save_uploaded
 from .playback import PlaybackControls
 from .build_guide import BuildGuideControls
 from .web_build_ui import WebBuildControls
+from .photo_selection import PhotoSelectionControls, PHOTO_PLANE_Z
 
 POINT_BUDGET = 50000
-PHOTO_PLANE_Z = 10000.0
 
 
 def _rotation(wxyz):
@@ -308,7 +308,7 @@ def _app_locked(method):
     return locked
 
 
-class ViewerApplication(RouteWorkflowControls, PlaybackControls, BuildGuideControls, WebBuildControls):
+class ViewerApplication(PhotoSelectionControls, RouteWorkflowControls, PlaybackControls, BuildGuideControls, WebBuildControls):
     def __init__(self, map_dir, sidecar_dir, *, port=8765, query_dir=None, snapshot_dir=None, server=None):
         self.map_dir = Path(map_dir).resolve()
         self.sidecar = ensure_sidecar(self.map_dir, sidecar_dir)
@@ -400,15 +400,12 @@ class ViewerApplication(RouteWorkflowControls, PlaybackControls, BuildGuideContr
             self._playback_ui()
             self._build_guide_ui()
         with self._object_tab:
-            gui.add_markdown('### 用独立照片寻找物体\n**选照片 → 打开原图 → Shift 拖动框选 → 计算。**\n\n'
+            gui.add_markdown('### 用独立照片寻找物体\n**选照片 → 打开原图 → 鼠标左键拖出绿框 → 计算。**\n\n'
                 '正式验证请使用未参与建图的独立采集照片。输出是可见表面的三维支持点，不是自动识别出的完整物体。')
             self.photo = gui.add_text('目标原图路径', '')
             self._photo_upload('选择目标照片', self.photo)
             self._button('打开原图并框选目标', self._open_photo)
-            with gui.add_folder('框选坐标（原图像素，可手动调整）', expand_by_default=False):
-                self.roi_min = gui.add_vector2('左上角 x / y', (0., 0.))
-                self.roi_max = gui.add_vector2('右下角 x / y', (1., 1.))
-            self._button('计算目标位置与证据', self._locate_object)
+            self._selection_ui()
             self.evidence_image = gui.add_image(np.zeros((2, 2, 3), np.uint8), label='匹配证据：绿色通过，红色排除', visible=False)
             with gui.add_folder('复用已有查询或目标结果', expand_by_default=False):
                 self.query_path = gui.add_text('查询结果文件夹', str(self._pending_query or ''))
@@ -475,6 +472,7 @@ class ViewerApplication(RouteWorkflowControls, PlaybackControls, BuildGuideContr
             if field is self.photo:
                 self._invalidate_target(clear_query=True)
                 self._query_selected = True
+                self.query_path.value = ''
             elif field is self.current_photo:
                 self._task_revision += 1
                 self.current_start = None
@@ -514,6 +512,10 @@ class ViewerApplication(RouteWorkflowControls, PlaybackControls, BuildGuideContr
                             self._completed(state)
                         elif state['status'] == 'failed':
                             self._seen.add(job_id)
+                            if (state.get('kind') == 'locate_object'
+                                    and self._job_revisions.get(job_id) == self._task_revision):
+                                self.roi_status.value = '计算失败，选框仍保留；请查看诊断后重试。'
+                                self.roi_submit.disabled = self._roi_selection is None
                             self._message('Job failed: '+state.get('error', 'unknown'))
                         elif state['status'] == 'running':
                             self._message(f"Running {state['kind']}; pid={state.get('worker_pid')}; job={job_id}")
@@ -592,14 +594,15 @@ class ViewerApplication(RouteWorkflowControls, PlaybackControls, BuildGuideContr
         @client.scene.on_rect_select(modifier='shift')
         def selected(event):
             try:
-                state = self._photo_states.get(event.client_id)
-                if not state:
-                    raise ValueError('open_raw_photo_before_selecting')
-                c = event.client.camera
-                roi = rectangle_to_roi(event.screen_min, event.screen_max, width=state['width'], height=state['height'],
-                    camera_position=c.position, camera_wxyz=c.wxyz, fov=c.fov, aspect=c.aspect)
-                self.roi_min.value, self.roi_max.value = tuple(roi[:2]), tuple(roi[2:])
-                self._message('Selected raw-photo ROI: '+str([round(x, 2) for x in roi]))
+                with self._state_lock:
+                    state = self._photo_states.get(event.client_id)
+                    if not state:
+                        raise ValueError('open_raw_photo_before_selecting')
+                    c = event.client.camera
+                    roi = rectangle_to_roi(event.screen_min, event.screen_max, width=state['width'], height=state['height'],
+                        camera_position=c.position, camera_wxyz=c.wxyz, fov=c.fov, aspect=c.aspect)
+                    self._select_roi(state, roi)
+                    self._message('已选中目标：绿框已保留，可拖四角或中心蓝块调整。')
             except Exception as exc:
                 self._message(str(exc))
 
@@ -651,37 +654,10 @@ class ViewerApplication(RouteWorkflowControls, PlaybackControls, BuildGuideContr
         else:
             self._submit('inspect_map', {'component_id': self.component.value.strip() or None})
 
-    def _open_photo(self, event):
-        self._pause_playback()
-        from PIL import Image
-        if event.client is None:
-            raise ValueError('photo_selection_requires_browser_client')
-        path = Path(self.photo.value).resolve()
-        with Image.open(path) as image:
-            width, height = image.size
-        client = event.client
-        old = self._photo_states.pop(client.client_id, None)
-        if old:
-            old['handle'].remove()
-        handle = client.scene.add_image('/roi/photo', _read_image(path, 1600),
-            render_width=2.*width/height, render_height=2., position=(0., 0., PHOTO_PLANE_Z),
-            wxyz=(0., 1., 0., 0.),  # Viser image local axes use OpenCV y-down.
-            cast_shadow=False, receive_shadow=False)
-        self._photo_states[client.client_id] = {'path': path, 'width': width, 'height': height, 'handle': handle}
-        client.camera.position = (0., 0., PHOTO_PLANE_Z+3.5)
-        client.camera.up_direction = (0., 1., 0.)
-        client.camera.look_at = (0., 0., PHOTO_PLANE_Z)
-        client.camera.wxyz = (0., 1., 0., 0.)
-        client.camera.fov = .9
-        self.roi_min.value, self.roi_max.value = (0., 0.), (float(width), float(height))
-        self._message('RAW PHOTO: Shift + drag a rectangle. Do not orbit; reopen photo to reset orientation.')
-
     def _return_map(self, event):
         self._pause_playback()
         if event.client:
-            state = self._photo_states.pop(event.client_id, None)
-            if state:
-                state['handle'].remove()
+            self._remove_photo_state(event.client_id)
             self._focus_map(event.client)
 
     def _config(self, capture_time=None):
@@ -719,20 +695,22 @@ class ViewerApplication(RouteWorkflowControls, PlaybackControls, BuildGuideContr
             self.query_result = None
             self.controller.clear('query')
             self.evidence_image.visible = False
-            for photo_state in self._photo_states.values():
-                photo_state['handle'].remove()
-            self._photo_states.clear()
+            self._clear_photo_selection()
             for client in self.server.get_clients().values():
                 self._focus_map(client)
 
     def _locate_object(self, _):
         self._require_final()
-        self._invalidate_target(clear_query=True)
-        self._submit('locate_object', {'photo': str(Path(self.photo.value).resolve()),
-            'roi': [*self.roi_min.value, *self.roi_max.value],
+        photo, roi = self._validated_selection()
+        self._invalidate_target(clear_query=False)
+        self.evidence_image.visible = False
+        self._submit('locate_object', {'photo': photo,
+            'roi': roi,
             'query_dir': self.query_path.value.strip() or None, 'mask_path': self.mask_path.value.strip() or None,
             'cluster_radius': float(self.cluster_radius.value) or None,
             'min_points': int(self.minimum_points.value), 'config': self._config()})
+        self.roi_status.value = '已提交计算：当前绿框就是本次目标区域。调整选框将使本次计算不再作为当前结果。'
+        self.roi_submit.disabled = True
 
     @_app_locked
     def load_query(self, directory):
@@ -795,9 +773,18 @@ class ViewerApplication(RouteWorkflowControls, PlaybackControls, BuildGuideContr
             if (binding.get('evidence_sha256') != evidence['evidence_sha256']
                     or digest_json(binding) != payload.get('roi_sha256')):
                 raise ValueError('object_evidence_binding_mismatch')
+            from PIL import Image
+            from .video import sha256_file
+            source = Path(self.photo.value).resolve()
+            with Image.open(source) as image:
+                width, height = image.size
+            self._select_roi({'path': source, 'sha256': sha256_file(source),
+                              'width': width, 'height': height}, binding['roi'])
             self.controller.load_object(payload, evidence)
             self._show_evidence(query_dir, roi=binding.get('roi'))
             self.target_result = payload
+            self.roi_status.value = ('计算完成：目标已有三维支持。' if payload['status'] == 'supported'
+                                     else '计算结束，但目标证据不足；可重新打开原图调整选框。')
         self.object_path.value = str(path)
         self._message('Object result: '+payload['status']+'; '+str(payload.get('failure_reason'))+
                       '\n'+str(path)+'\nVisible surface support only; historical observations.')

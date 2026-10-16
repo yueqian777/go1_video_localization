@@ -70,7 +70,7 @@ New-Item -ItemType Directory -Path $env:TEMP -Force | Out-Null
 界面操作顺序：
 
 1. 选择 `final_map_replay` 并加载地图；参考帧下拉框显示真实PTS，无时间信息时明确提示不可用。
-2. 填写目标照片路径，点击 `Open raw photo for visual ROI`，按住 Shift 拖动选框；四个ROI数值是原照片像素，可手动校正。填入适用于这台相机的标定/内参，需要时加同尺寸掩膜。
+2. 选择目标照片，点击“打开原图并框选目标”，直接用鼠标左键拖出绿框；松手后框保留，四角方块可缩放、中心蓝块可移动。确认“已选中”及选框预览后计算。四个 ROI 数值是原照片像素，也可手动校正。填入适用于这台相机的标定/内参，需要时加同尺寸掩膜。
 3. 点击 `Compute photo ROI -> 3D support`。可填写已有查询目录以复用**通过哈希及参数一致性校验**的证据；结果状态、点数与失败原因留在sidecar。
 4. 点击 `Return to 3D map` 看查询相机与目标支持。`Load saved query/object` 可以重新载入已有证据。
 5. 起点用 `Localize independent current photo` 或明确的 `MANUAL start`；载入已审核路线图后点击 `Compute route preview`。当前照片没有合法接入时仍拒绝，不会因定位成功自动吸附近邻。

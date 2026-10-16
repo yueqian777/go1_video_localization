@@ -26,6 +26,9 @@ class Handle:
         self.scene.active.pop(self.name, None)
     def on_click(self, callback):
         return callback
+    def on_drag(self, callback):
+        self.drag = callback
+        return callback
 
 
 class Scene:
@@ -40,6 +43,7 @@ class Scene:
     add_frame = add
     add_label = add
     add_line_segments = add
+    add_box = add
     def add_image(self, name, image, **kwargs):
         return self.add(name, image=image, **kwargs)
     def set_up_direction(self, value):
@@ -326,7 +330,8 @@ class ApplicationTests(unittest.TestCase):
         self.client.scene.select(selection)
         self.assertLess(self.app.roi_min.value[0], self.app.roi_max.value[0])
         self.app._open_photo(self.event)  # replacing a selection plane, not leaking handles
-        self.assertEqual(len(self.client.scene.active), 1)
+        self.assertIn('/roi/outline', self.client.scene.active)
+        self.assertEqual(len(self.client.scene.active), 7)  # image, outline, four corners, center
         self.app._show_frame(self.event)
         self.assertTrue(self.app.reference_image.visible)
         self.app._return_map(self.event)
@@ -356,6 +361,10 @@ class ApplicationTests(unittest.TestCase):
         self.app.camera_model.value = 'PINHOLE'
         self.app.camera_params.value = '[100,100,200,100]'
         self.app.calibration.value = '/calibration.json'
+        self.app._connect(self.client)
+        self.app._open_photo(self.event)
+        self.client.scene.select(SimpleNamespace(client=self.client, client_id=1,
+            screen_min=(.4, .4), screen_max=(.6, .6)))
         self.app._locate_object(None)
         self.assertEqual(self.app.jobs.submitted[-1][0], 'locate_object')
         self.app.current_photo.value = str(self.photo)
