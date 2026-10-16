@@ -18,6 +18,14 @@ STAGES = {'prepare_video': '解码、抽帧与质量检查', 'build_map': '准�
           'completed': '最终地图已生成', 'initializing': '初始化重建'}
 
 
+def build_failure_help(error):
+    if 'sfm_did_not_produce_a_3d_model' in str(error):
+        return ('未能建立三维地图：没有找到满足几何条件的初始图像对。常见原因是相机位置几乎不变、'
+                '仅原地转动，或匹配/内参不合适。请采集有缓慢平移、连续重叠视角的录像；'
+                '仅提高画面清晰度不能替代视差。原素材和诊断结果已保留。')
+    return str(error)
+
+
 def _integers(values):
     if any(not np.isfinite(v) or int(v) != v for v in values):
         raise ValueError('坐标必须是原始解码帧中的整数像素。')
@@ -39,13 +47,19 @@ class WebBuildControls:
         self._web_applied_job = None
         gui = self.server.gui
         with gui.add_folder('新建地图：选视频 → 开始 → 看进度', expand_by_default=True):
-            gui.add_markdown('**不用打开 PowerShell。** 选择本机 MP4，检查首帧后开始。每次自动新建目录，旧地图和原视频不改动。\n\n'
+            gui.add_markdown('**不用打开 PowerShell。** 可直接选择录制台保存的原始记录，或上传 MP4 / MKV。检查首帧后开始。每次自动新建目录，旧地图和原视频不改动。\n\n'
                              '仅本机处理、不上传云端、不连接机器狗。建议先试 30 秒；网页单文件 ≤512 MiB、单次 ≤240 帧。')
-            self.web_upload = gui.add_upload_button('① 选择视频 MP4', mime_type='video/mp4')
+            self.web_capture_choice = gui.add_dropdown('① 录制台已保存记录（推荐，无需导出视频）', ['（暂无完整记录）'])
+            self._button('刷新本机录制记录', self._web_refresh_captures)
+            self.web_capture_select = self._button('使用选中记录建图', self._web_select_capture)
+            gui.add_markdown('只读取本项目 data/captures 下已结束的录像；不启动采集、不连接相机。PNG 和读取时间直接进入建图。')
+            self._web_capture_options = {}
+            self._web_refresh_captures(None)
+            self.web_upload = gui.add_upload_button('或选择视频 MP4 / MKV', mime_type='.mp4,.mkv')
             self.web_upload.on_upload(self._guard(self._web_upload))
             self.web_status = gui.add_text('视频任务进度', '请选择视频。下方已有地图仍可查看。', multiline=True, disabled=True)
             self.web_native = gui.add_image(np.zeros((2, 2, 3), np.uint8), label='所选视频首帧（完整解码尺寸）', visible=False)
-            self.web_kind = gui.add_dropdown('素材来源', ['Go1 界面录屏', '原始单路视频'])
+            self.web_kind = gui.add_dropdown('素材来源', ['Go1 界面录屏', '原始单路视频', '录制台原始记录（PNG）'])
             with gui.add_folder('② 核对单路画面与排除区域', expand_by_default=False):
                 gui.add_markdown('坐标以首帧实际像素为准。录屏中的十字线、图标、边框和固定遮挡可添加为排除矩形；'
                     '红色仅为诊断叠加，不涂黑输入。实际在 SuperPoint 后、LightGlue 前排除特征。\n\n'
@@ -64,7 +78,14 @@ class WebBuildControls:
                 self.web_evidence = gui.add_text('几何判断依据（未知时留空）', '')
                 self._button('更新裁剪与有效区域预览', self._web_preview)
                 self.web_mask_image = gui.add_image(np.zeros((2, 2, 3), np.uint8), label='裁剪后有效区域：红色不参与特征匹配', visible=False)
-                gui.add_markdown('此简易入口未输入实测标定，不额外去畸变；重建内参为近似估计，长度仍是 map_units。')
+                gui.add_markdown('录屏裁剪不能套用原相机内参。原始视频或原始记录可在下面导入对应相机的实测标定；未导入时不额外去畸变，内参近似估计。')
+            with gui.add_folder('可选：相机实测标定（不沿用旧鱼眼参数）', expand_by_default=False):
+                gui.add_markdown('先选素材、等待首帧，再选标定 JSON。支持普通 OpenCV / pinhole 和原始 fisheye；'
+                    '核验分辨率、投影模式以及原始记录的相机身份。未知几何需提供标定中的投影依据。没有标定可以先探索建图，长度仍为 map_units。')
+                self.web_calibration_upload = gui.add_upload_button('选择该相机的标定 JSON', mime_type='.json')
+                self.web_calibration_upload.on_upload(self._guard(self._web_calibration_upload))
+                self.web_calibration_clear = self._button('移除本次标定，使用近似内参', self._web_clear_calibration)
+                self.web_calibration_info = gui.add_text('当前标定', '未选择：不额外去畸变。', multiline=True, disabled=True)
             self.web_start_s = gui.add_number('从视频第几秒开始', 0., min=0., step=1.)
             self.web_duration = gui.add_number('处理时长（秒）', 30., min=.1, max=600., step=1.)
             self.web_interval = gui.add_number('抽帧间隔（秒）', .5, min=.05, max=10., step=.05)
@@ -85,6 +106,45 @@ class WebBuildControls:
             self.web_evidence, self.web_start_s, self.web_duration, self.web_interval, self.web_explore,
             self.web_confirm)
 
+    def _web_refresh_captures(self, _):
+        from .web_capture import list_captures
+        rows = list_captures()
+        self._web_capture_options = {
+            f"{r['capture_id']} | {r['source_kind']} · 相机{r['camera_id']} · {r['width']}×{r['height']} · {r['frames']}帧": r['capture_id']
+            for r in rows}
+        old = self.web_capture_choice.value
+        options = list(self._web_capture_options) or ['（暂无完整记录）']
+        self.web_capture_choice.options = options
+        self.web_capture_choice.value = old if old in options else options[0]
+
+    def _web_select_capture(self, _):
+        capture_id = self._web_capture_options.get(self.web_capture_choice.value)
+        if capture_id is None:
+            raise ValueError('请选择已完成的录像记录；单张照片和未结束录像不用于建图。')
+        self.web_build.select_capture(capture_id)
+        self._web_unconfirm()
+        self.web_native.visible = False
+        self.web_start_button.disabled = True
+        self.web_status.value = '正在核验原始PNG、帧序号和时间记录；不会连接相机。'
+
+    def _web_calibration_upload(self, event):
+        upload = event.target.value
+        if upload is None:
+            return
+        if self.web_kind.value == 'Go1 界面录屏':
+            raise ValueError('请先选择原始单路视频或录制台原始记录；录屏不能套用原相机标定。')
+        row = self.web_build.set_calibration(upload.name, upload.content)
+        self.web_calibration_info.value = f"已采用 {upload.name} · {row['model']} · {row['image_size']}；仅绑定当前素材。"
+        self._web_unconfirm()
+        self._web_preview(None)
+
+    def _web_clear_calibration(self, _):
+        self.web_build.clear_calibration()
+        self.web_calibration_info.value = '未选择：不额外去畸变，内参近似估计。'
+        self._web_unconfirm()
+        if self.web_build.inspection():
+            self._web_preview(None)
+
     def _web_unconfirm(self):
         self.web_confirm.value = False
         self.web_mask_image.visible = False
@@ -94,13 +154,14 @@ class WebBuildControls:
         if upload is None:
             return
         self.web_build.upload(upload.name, upload.content)
+        self.web_kind.value = '原始单路视频'
         self._web_unconfirm()
         self.web_native.visible = False
-        self.web_status.value = '正在检查视频并解码原尺寸首帧；尚未开始建图。'
+        self.web_status.value = '正在检查视频并解码原尺寸首帧；默认按普通视频处理，若是界面录屏请切换素材来源。'
         self.web_start_button.disabled = True
 
     def _web_settings(self):
-        return dict(kind='screen' if self.web_kind.value == 'Go1 界面录屏' else 'video',
+        return dict(kind={'Go1 界面录屏': 'screen', '原始单路视频': 'video', '录制台原始记录（PNG）': 'capture'}[self.web_kind.value],
             confirmed=bool(self.web_confirm.value), start=float(self.web_start_s.value),
             duration=float(self.web_duration.value), interval=float(self.web_interval.value),
             exploratory=bool(self.web_explore.value),
@@ -145,6 +206,19 @@ class WebBuildControls:
             rgb = crop_image(rgb, screen)
             excluded = effective_mask(screen) == 0
             rgb[excluded] = (rgb[excluded].astype(float)*.3 + np.array([255, 30, 30])*.7).astype(np.uint8)
+        calibration = self.web_build.record.get('calibration')
+        if calibration:
+            if screen:
+                raise ValueError('请移除原相机标定后再使用录屏模式。')
+            import cv2
+            from .web_capture import resolve_calibration
+            from .calibration import load_calibration, build_rectification
+            path = resolve_calibration(self.web_build.root, self.web_build.record['upload'], inspection,
+                                       calibration['calibration_id'])
+            rect = build_rectification(load_calibration(path))
+            rgb = cv2.remap(rgb, rect['map_x'], rect['map_y'], cv2.INTER_LINEAR)
+            x, y, w, h = rect['crop_xywh']
+            rgb = rgb[y:y+h, x:x+w]
         self.web_mask_image.image = rgb
         self.web_mask_image.visible = True
         self.web_masks.value = '\n'.join(f'{i+1}. x={r[0]}, y={r[1]}, 宽={r[2]}, 高={r[3]}'
@@ -243,6 +317,9 @@ class WebBuildControls:
             return
         busy = state['status'] in ('queued', 'running')
         self.web_upload.disabled = busy
+        self.web_capture_select.disabled = busy
+        self.web_capture_choice.disabled = busy
+        self.web_calibration_upload.disabled = self.web_calibration_clear.disabled = busy
         self.web_start_button.disabled = busy
         for field in self._web_config_fields:
             field.disabled = busy
@@ -263,6 +340,16 @@ class WebBuildControls:
             self.web_window.value = '单路视图（请核实）'
             self.web_confirm.value = False
             self.web_explore.value = False
+            native = inspection.get('input_kind') == 'capture'
+            if native:
+                self.web_kind.value = '录制台原始记录（PNG）'
+                self.web_camera.value = str(inspection['source']['camera_id'])
+                self.web_camera_label.value = inspection['source_kind']
+            elif self.web_kind.value == '录制台原始记录（PNG）':
+                self.web_kind.value = '原始单路视频'
+            calibration = self.web_build.record.get('calibration')
+            self.web_calibration_info.value = (f"已采用 {calibration['original_name']} · {calibration['model']}；绑定当前素材。"
+                                               if calibration else '未选择：不额外去畸变，内参近似估计。')
             saved = self.web_build.record.get('settings')
             if saved:
                 self.web_crop_xy.value, self.web_crop_wh.value = tuple(saved['crop'][:2]), tuple(saved['crop'][2:])
@@ -270,7 +357,7 @@ class WebBuildControls:
                 self.web_camera.value, self.web_camera_label.value = saved['camera_id'], saved['camera_label']
                 self.web_evidence.value, self.web_window.value = saved['display_evidence'], saved['window']
                 self.web_display.value = next(k for k, v in DISPLAY_MODES.items() if v == saved['display_mode'])
-                self.web_kind.value = 'Go1 界面录屏' if saved['kind'] == 'screen' else '原始单路视频'
+                self.web_kind.value = {'screen': 'Go1 界面录屏', 'video': '原始单路视频', 'capture': '录制台原始记录（PNG）'}[saved['kind']]
                 self.web_start_s.value, self.web_duration.value, self.web_interval.value = saved['start'], saved['duration'], saved['interval']
                 self.web_explore.value = saved['exploratory']
             self._web_preview(None)
@@ -279,11 +366,13 @@ class WebBuildControls:
         phase = build.get('stage', progress.get('stage', '检查视频 / 等待解码'))
         display_status = 'failed' if build.get('status') == 'failed' else state['status']
         status = {'queued': '已排队', 'running': '进行中', 'completed': '已完成', 'failed': '失败（数据保留）'}[display_status]
-        error = state.get('error') or build.get('failure_reason') or ''
+        error = build_failure_help(state.get('error') or build.get('failure_reason') or '')
         probe_text = ''
         if inspection:
             p = inspection['probe']
-            probe_text = f"原尺寸 {p['width']}×{p['height']}；视频时长 {p.get('duration_s')} 秒。\n"
+            probe_text = f"原尺寸 {p['width']}×{p['height']}；记录时长 {p.get('duration_s'):.3f} 秒。\n" if p.get('duration_s') is not None else f"原尺寸 {p['width']}×{p['height']}；时长未知。\n"
+            if inspection.get('input_kind') == 'capture':
+                probe_text += f"来源 {inspection['source_kind']}；时间为读取时间，不是曝光时间。\n"
         self.web_status.value = (probe_text + f"{status} · {STAGES.get(phase, phase)}\n"
             f"候选帧 {progress.get('candidate_count', '待统计')}；保留 {progress.get('kept_count', '待统计')}；完整快照 {len(build.get('snapshots', []))} 份。\n"
             f"{'低质量探索，不算正式验收。' if progress.get('exploratory') else ''}\n{error}\n保存位置：{state['job_dir']}")

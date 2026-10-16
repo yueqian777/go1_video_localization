@@ -47,6 +47,7 @@ def main():
         wait_for(lambda: app._web_preview_id is not None, 90, lambda: app.web_status.value)
         with app._state_lock:
             assert app.web_native.visible
+            app.web_kind.value = 'Go1 界面录屏'
             assert app.web_native.image.shape[:2] == (config['source_size_wh'][1], config['source_size_wh'][0])
             app.web_crop_xy.value = tuple(config['crop_xywh'][:2])
             app.web_crop_wh.value = tuple(config['crop_xywh'][2:])

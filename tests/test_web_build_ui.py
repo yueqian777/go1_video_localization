@@ -23,6 +23,75 @@ class StateJobs(fixtures.Jobs):
 
 class WebBuildUITests(unittest.TestCase):
     setUp = fixtures.ApplicationTests.setUp
+
+    def test_native_recording_selector_and_calibration_controls(self):
+        app = self.app
+        rows = [dict(capture_id='rgb-clip', source_kind='orbbec_rgb_mjpeg', camera_id=6,
+                     width=1280, height=720, frames=955)]
+        with patch('go1loc.web_capture.list_captures', return_value=rows):
+            app._web_refresh_captures(None)
+        self.assertIn('rgb-clip', app.web_capture_choice.value)
+        with patch.object(app.web_build, 'select_capture') as select:
+            app._web_select_capture(None)
+        select.assert_called_once_with('rgb-clip')
+        app.web_kind.value = '录制台原始记录（PNG）'
+        self.assertEqual(app._web_settings()['kind'], 'capture')
+        with patch.object(app.web_build, 'set_calibration', return_value=dict(model='opencv', image_size=[1280,720])), \
+             patch.object(app, '_web_preview'):
+            app._web_calibration_upload(SimpleNamespace(target=SimpleNamespace(value=SimpleNamespace(
+                name='cal.json', content=b'{}'))))
+        self.assertIn('opencv', app.web_calibration_info.value)
+        self.assertFalse(app.web_confirm.value)
+
+    def test_native_preview_tick_reconnect_and_clear_calibration(self):
+        app = self.app
+        inspection = dict(input_kind='capture', source_kind='orbbec_rgb_mjpeg', source={'camera_id': 6},
+            probe=dict(width=400, height=200, duration_s=63.5, source_sha256='a'*64), preview=str(self.photo))
+        app.web_build.record = {'upload': {'upload_id': 'a'*32}}
+        state = dict(job_id='b'*32, status='completed', kind='inspect_video', job_dir=str(self.root/'inspect'))
+        with patch.object(app.web_build, 'state', return_value=state), \
+             patch.object(app.web_build, 'inspection', return_value=inspection):
+            app._web_tick()
+            self.assertEqual(app.web_kind.value, '录制台原始记录（PNG）')
+            self.assertEqual(app.web_camera.value, '6')
+            self.assertEqual(app.web_native.image.shape, (200, 400, 3))
+            self.assertIn('读取时间', app.web_status.value)
+            app.web_build.record['settings'] = app._web_settings()
+            app.web_build.record['settings']['start'] = 5.
+            app._web_preview_id = None
+            app._web_tick()
+            self.assertEqual(app.web_start_s.value, 5.)
+            with patch.object(app.web_build, 'clear_calibration') as clear:
+                app._web_clear_calibration(None)
+            clear.assert_called_once()
+            self.assertIn('近似', app.web_calibration_info.value)
+
+    def test_failed_initialization_has_actionable_chinese_explanation(self):
+        from go1loc.web_build_ui import build_failure_help
+        self.assertIn('平移', build_failure_help('PipelineInputError: sfm_did_not_produce_a_3d_model'))
+        self.assertEqual(build_failure_help('other error'), 'other error')
+
+    def test_route_controls_bind_disabled_edges_and_invalidate_old_plan(self):
+        from test_planning import fixture, inputs
+        from go1loc.planning import build_route_graph
+        app = self.app
+        graph = build_route_graph(*fixture())
+        with patch.object(app, '_read_graph', return_value=graph):
+            app._route_refresh_edges(None)
+            edge = next(iter(graph['edges']))
+            app.route_edge_choice.value = next(label for label, eid in app._route_edge_options.items() if eid == edge)
+            app.plan_result = {'status': 'old'}
+            app._route_disable_edge(None)
+            self.assertIsNone(app.plan_result)
+            app.current_start, app.target_result = inputs(graph)
+            app.route_avoidance.value = True
+            with patch.object(app, '_require_final'), patch.object(app, '_submit') as submit:
+                app._plan_route(None)
+            self.assertEqual(submit.call_args.args[1]['disabled_edge_ids'], [edge])
+            self.assertTrue(submit.call_args.args[1]['local_avoidance_assumed'])
+            app._route_restore_edges(None)
+            self.assertEqual(app._route_disabled_edges, set())
+
     def test_upload_callback_submits_inspection_without_shell(self):
         with patch.object(self.app.web_build, 'upload') as upload:
             event = SimpleNamespace(target=SimpleNamespace(value=SimpleNamespace(name='中文.mp4', content=b'video')))

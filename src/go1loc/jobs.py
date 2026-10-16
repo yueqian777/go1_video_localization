@@ -25,7 +25,7 @@ KINDS = {
     'inspect_build_snapshot': {'run_dir', 'snapshot_index', 'point_budget'},
     'locate_object': {'photo', 'roi', 'mask_path', 'query_dir', 'cluster_radius', 'min_points', 'config'},
     'localize_current': {'photo', 'config'},
-    'plan_route': {'graph_path', 'start', 'target', 'time_mode', 'replay_reference_time'},
+    'plan_route': {'graph_path', 'start', 'target', 'time_mode', 'replay_reference_time', 'disabled_edge_ids', 'local_avoidance_assumed'},
     'prepare_route_review': {'max_gap_s'},
     'save_route_review': {'input_sha256', 'decisions', 'max_gap_s', 'component_id'},
 }
@@ -303,7 +303,9 @@ def execute_job(request):
             raise ValueError('planning_graph_map_mismatch')
         payload = plan_route(graph, params['start'], params['target'], now=utc_now(),
                     time_mode=params.get('time_mode', 'live_current'),
-                    replay_reference_time=params.get('replay_reference_time'))
+                    replay_reference_time=params.get('replay_reference_time'),
+                    disabled_edge_ids=params.get('disabled_edge_ids', []),
+                    local_avoidance_assumed=params.get('local_avoidance_assumed', False))
         path = output/'planning_result.json'
         atomic_json(path, payload)
     else:  # fixed localize_current entry, no arbitrary import or command

@@ -20,7 +20,7 @@ import numpy as np
 
 IDENTITY = ("map_id", "map_hash", "component_id")
 PHOTO_BINDING = (*IDENTITY, "query_id", "photo_sha256", "captured_at", "localized_at")
-SOURCE_KINDS = {"video", "synthetic_test", "go1_screen_recording"}
+SOURCE_KINDS = {"video", "synthetic_test", "go1_screen_recording", "go1_shm_readonly", "go1_native_network", "orbbec_rgb_mjpeg"}
 POSE_ATOL = 1e-7  # Numerical consistency, NOT a physical snapping radius.
 
 
@@ -585,7 +585,8 @@ def _dijkstra(graph: dict, start: str, disabled: set[str]) -> tuple[dict, dict]:
 def plan_route(graph: dict, start: dict, target: dict, *, now: str,
                max_start_age_s: float = 30.0, disabled_edge_ids: tuple | list = (),
                T_BC: Any = None, time_mode: str = "live_current",
-               replay_reference_time: str | None = None) -> dict:
+               replay_reference_time: str | None = None,
+               local_avoidance_assumed: bool = False) -> dict:
     """Dijkstra preview to an actually supported reference observation camera.
 
     `now` must be a timezone-aware ISO time, supplied explicitly for purity.
@@ -594,6 +595,11 @@ def plan_route(graph: dict, start: dict, target: dict, *, now: str,
     Missing connectivity never produces a straight-line fallback.
     """
     now_value, reference_time = _time_context(now, time_mode, replay_reference_time)
+    if type(local_avoidance_assumed) is not bool:
+        raise ValueError('invalid_local_avoidance_assumption')
+    if (not isinstance(disabled_edge_ids, (tuple, list))
+            or any(not isinstance(e, str) for e in disabled_edge_ids)):
+        raise ValueError('invalid_disabled_edges')
     max_age = _number(max_start_age_s)
     if max_age < 0:
         raise ValueError("invalid_max_start_age_s")
@@ -609,6 +615,12 @@ def plan_route(graph: dict, start: dict, target: dict, *, now: str,
         "target_object_result": deepcopy(target), "goal_observation_pose": None,
         "goal_frame_id": None, "goal_candidates": [], "route_node_ids": [],
         "route_edge_ids": [], "path": [], "length": None,
+        "disabled_edge_ids": sorted(set(disabled_edge_ids)), "itinerary": [],
+        "avoidance_context": {
+            "state": "assumed_not_verified" if local_avoidance_assumed else "not_assumed",
+            "role": "onboard_local_obstacle_avoidance_not_global_connectivity",
+            "robot_state_read": False, "motion_commands_sent": False,
+            "requires_runtime_verification_before_execution": True},
         "units": graph.get("units"), "scale_status": graph.get("scale_status"),
         "status": "rejected", "failure_reason": None,
         "route_kind": "camera_route", "route_preview_only": True,
@@ -688,4 +700,23 @@ def plan_route(graph: dict, start: dict, target: dict, *, now: str,
                   goal_observation_pose=deepcopy(graph["nodes"][goal]["T_MC"]),
                   route_node_ids=nodes, route_edge_ids=edges, path=path, length=_length(path))
     result["connectivity_provenance"]["edges"] = [deepcopy(graph["edges"][e]["provenance"]) for e in edges]
+    # Do not smooth corners into obstacles, invent speeds, or label turns left/
+    # right in an arbitrary monocular map without a verified gravity/up axis.
+    cumulative = _length(prefix)
+    positions = [_position(graph['nodes'][n]['T_MC']) for n in nodes]
+    for i, name in enumerate(nodes):
+        if i:
+            cumulative += graph['edges'][edges[i-1]]['length']
+        angle = None
+        if 0 < i < len(nodes)-1:
+            incoming = np.subtract(positions[i], positions[i-1])
+            outgoing = np.subtract(positions[i+1], positions[i])
+            norm = np.linalg.norm(incoming)*np.linalg.norm(outgoing)
+            if norm > 1e-12:
+                angle = float(np.degrees(np.arccos(np.clip(np.dot(incoming, outgoing)/norm, -1., 1.))))
+        result['itinerary'].append(dict(index=i, frame_id=name, position=positions[i],
+            source_time_s=graph['nodes'][name].get('pts_time_s'), distance_from_start=cumulative,
+            units=graph['units'], turn_angle_deg=angle, turn_frame='3d_camera_polyline_not_body_yaw',
+            outgoing_edge_id=edges[i] if i < len(edges) else None,
+            role='goal_observation' if i == len(nodes)-1 else 'historical_waypoint'))
     return result

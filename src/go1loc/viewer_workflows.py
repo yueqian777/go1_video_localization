@@ -118,6 +118,12 @@ class RouteWorkflowControls:
 
     def _reset_workflows(self):
         self._clear_connection_preview()
+        if hasattr(self, '_route_disabled_edges'):
+            self._route_restore_edges(None)
+            self._route_edges_graph = None
+            self._route_edge_options = {}
+            self.route_edge_choice.options = ['（先读取路线图）']
+            self.route_edge_choice.value = self.route_edge_choice.options[0]
         self._review_revision += 1
         self.route_review = None
         self.controller.clear('review_candidate')

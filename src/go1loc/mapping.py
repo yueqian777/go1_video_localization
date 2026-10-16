@@ -199,6 +199,10 @@ def _write_manifest(output_dir: Path, config: MappingConfig, image_dir: Path, mo
             manifest['source_kind'] = 'go1_screen_recording'
             manifest['timing_source'] = 'screen_display'
             manifest['execution_permitted'] = False
+        elif manifest['frames_manifest'].get('source_kind') in {'go1_shm_readonly', 'go1_native_network', 'synthetic_test', 'orbbec_rgb_mjpeg'}:
+            manifest['source_kind'] = manifest['frames_manifest']['source_kind']
+            manifest['timing_source'] = manifest['frames_manifest']['timing_source']
+            manifest['execution_permitted'] = False
     else:
         manifest['frames_manifest'] = None
         manifest['frames_manifest_sha256'] = None
@@ -408,8 +412,8 @@ def _build_map(image_dir, output_dir, config, refs, frame_times, frame_data, wor
             screen_source = frame_data is not None and frame_data.get('source_kind') == 'go1_screen_recording'
             publisher = SnapshotPublisher(run_dir / 'snapshots', events=events,
                 max_count=config.snapshot_max_count, max_bytes=config.snapshot_max_bytes,
-                timing_source='screen_display' if screen_source else 'video_pts_not_exposure_time',
-                source_kind='go1_screen_recording' if screen_source else None)
+                timing_source=(frame_data or {}).get('timing_source', 'screen_display' if screen_source else 'video_pts_not_exposure_time'),
+                source_kind=(frame_data or {}).get('source_kind'))
             model = _reconstruct_with_snapshots(reconstruction, sfm_dir, work_image_dir, pairs_path,
                        local_path, match_path, refs, camera_mode, image_options, mapper_options,
                        publisher, config, frame_times, events)

@@ -437,6 +437,20 @@ class ViewerApplication(RouteWorkflowControls, PlaybackControls, BuildGuideContr
             gui.add_markdown('### 检查准备情况并预览路线\n需要：已支持的目标、明确起点、已审核路线图。独立照片起点还需要合法接入证据。\n\n'
                 '**终点是能观察目标的参考相机位置，不是物体中心。所有结果禁止直接用于机器人执行。**')
             self.graph_path = gui.add_text('已审核路线图文件', '', hint='在「④ 路段」保存后自动填入；也可填已有 route_graph.json。')
+            self.route_avoidance = gui.add_checkbox('按机载局部避障可用的前提预览（未读取实机状态）', False)
+            self.route_avoidance.on_update(self._guard(lambda _: self._invalidate_plan()))
+            gui.add_markdown('全局路线沿已审核历史路段选择最短路；局部避障处理执行时的近处障碍。'
+                             '无需预先证明每处当前空旷，但避障不能把断路或隔墙连线变成通路。本页不控制机器狗。')
+            self._route_disabled_edges = set()
+            self._route_edge_options = {}
+            self._route_edges_graph = None
+            with gui.add_folder('路段封闭与重新规划', expand_by_default=False):
+                self._button('读取可选路段', self._route_refresh_edges)
+                self.route_edge_choice = gui.add_dropdown('选择要排除的有向路段', ['（先读取路线图）'])
+                self._button('本次避开这条路段', self._route_disable_edge)
+                self._button('取消本次所有路段排除', self._route_restore_edges)
+                self.route_blocked_info = gui.add_text('本次排除', '无', multiline=True, disabled=True)
+            self.route_summary = gui.add_text('路线摘要与途经点', '计算后显示距离、途经点和转角。', multiline=True, disabled=True)
             self._button('计算离线路线预览', self._plan_route)
             self._button('导出当前路线结果', self._save_plan)
             with gui.add_folder('载入已有路线结果', expand_by_default=False):
@@ -560,8 +574,10 @@ class ViewerApplication(RouteWorkflowControls, PlaybackControls, BuildGuideContr
             if payload.get('status') == 'route_preview_only':
                 self.controller.load_plan(payload)
                 self.plan_result = payload
+                self._route_show_summary(payload)
                 self._message('Computed camera route preview; execution_permitted=false.\n'+str(result_path))
             else:
+                self.route_summary.value = '没有生成路线：'+str(payload.get('failure_reason'))+'。可检查起点、已审核路段和排除列表。'
                 self._message('Route rejected: '+str(payload.get('failure_reason'))+'\n'+str(result_path))
         elif kind == 'localize_current':
             self._apply_current(payload)
@@ -689,6 +705,8 @@ class ViewerApplication(RouteWorkflowControls, PlaybackControls, BuildGuideContr
         self.controller.clear('route')
         self.controller.clear('goal')
         self.plan_path.value = ''
+        if hasattr(self, 'route_summary'):
+            self.route_summary.value = '输入已变化，请重新计算路线。'
 
     def _invalidate_target(self, *, clear_query=False):
         self._invalidate_plan()
@@ -791,9 +809,52 @@ class ViewerApplication(RouteWorkflowControls, PlaybackControls, BuildGuideContr
         self.controller.clear('route')
         self.controller.clear('goal')
         self.plan_result = None
+        if self._route_disabled_edges:
+            graph = self._read_graph()
+            if graph['graph_sha256'] != self._route_edges_graph:
+                raise ValueError('路线图已变化，请重新读取并选择要排除的路段。')
         self._submit('plan_route', {'graph_path': str(Path(self.graph_path.value).resolve()),
                                    'start': self.current_start, 'target': self.target_result,
+                                   'disabled_edge_ids': sorted(self._route_disabled_edges),
+                                   'local_avoidance_assumed': bool(self.route_avoidance.value),
                                    **self._planning_time()})
+
+    def _route_refresh_edges(self, _):
+        graph = self._read_graph()
+        if self._route_edges_graph != graph['graph_sha256']:
+            self._route_restore_edges(None)
+        self._route_edges_graph = graph['graph_sha256']
+        self._route_edge_options = {
+            f"{edge['from']} → {edge['to']} | {eid}": eid
+            for eid, edge in graph['edges'].items() if edge.get('enabled') is True}
+        self.route_edge_choice.options = list(self._route_edge_options) or ['（没有已审核路段）']
+        self.route_edge_choice.value = self.route_edge_choice.options[0]
+
+    def _route_disable_edge(self, _):
+        graph = self._read_graph()
+        if graph['graph_sha256'] != self._route_edges_graph:
+            raise ValueError('路线图已变化，请先重新读取路段。')
+        edge_id = self._route_edge_options.get(self.route_edge_choice.value)
+        if edge_id is None:
+            raise ValueError('请选择已审核路段。')
+        self._route_disabled_edges.add(edge_id)
+        self.route_blocked_info.value = '\n'.join(sorted(self._route_disabled_edges))
+        self._invalidate_plan()
+
+    def _route_restore_edges(self, _):
+        self._route_disabled_edges.clear()
+        self.route_blocked_info.value = '无'
+        self._invalidate_plan()
+
+    def _route_show_summary(self, payload):
+        lines = [f"终点观察帧：{payload.get('goal_frame_id')}；路径长度：{payload.get('length', 0):.3f} {payload.get('units')}"]
+        if payload.get('avoidance_context', {}).get('state') == 'assumed_not_verified':
+            lines.append('使用假设：机载局部避障可用；未核验实机。')
+        for row in payload.get('itinerary', []):
+            turn = f"；三维折线转角 {row['turn_angle_deg']:.1f}°" if row.get('turn_angle_deg') is not None else ''
+            lines.append(f"{row['index']+1}. {row['frame_id']} · 累计 {row['distance_from_start']:.3f} {row['units']}{turn}")
+        lines.append('相机历史路线，不是机身控制指令；不自动执行。')
+        self.route_summary.value = '\n'.join(lines)
 
     def _localize_current(self, _):
         self._require_final()
@@ -839,6 +900,7 @@ class ViewerApplication(RouteWorkflowControls, PlaybackControls, BuildGuideContr
         self.plan_result = None
         self.controller.load_plan(payload)
         self.plan_result = payload
+        self._route_show_summary(payload)
         self._message('Loaded saved CAMERA ROUTE PREVIEW. execution_permitted=false.\n'
                       'Source provenance is retained; historical route does not prove current clearance.')
 
