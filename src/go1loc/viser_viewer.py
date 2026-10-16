@@ -19,7 +19,8 @@ import numpy as np
 
 from .jobs import JobManager, atomic_json, ensure_sidecar, read_json, utc_now
 from .viewer_workflows import RouteWorkflowControls
-from .viewer_text import VIEW_MODES, human_status, protocol_value, save_uploaded_image
+from .viewer_text import (VIEW_MODES, human_status, protocol_value, save_uploaded_image,
+                          query_failure_notice, query_camera_notice, object_failure_notice)
 from .playback import PlaybackControls
 from .build_guide import BuildGuideControls
 from .web_build_ui import WebBuildControls
@@ -409,11 +410,15 @@ class ViewerApplication(PhotoSelectionControls, RouteWorkflowControls, PlaybackC
             self.evidence_image = gui.add_image(np.zeros((2, 2, 3), np.uint8), label='匹配证据：绿色通过，红色排除', visible=False)
             with gui.add_folder('复用已有查询或目标结果', expand_by_default=False):
                 self.query_path = gui.add_text('查询结果文件夹', str(self._pending_query or ''))
+                self.reuse_query = gui.add_checkbox('复用已载入且定位成功的证据（不重新求解照片）', False)
                 self._button('载入已有照片定位证据', lambda _: self.load_query(Path(self.query_path.value)))
                 self.object_path = gui.add_text('目标结果文件（object_result.json）', '')
                 self._button('载入已有目标支持点', lambda _: self.load_object(Path(self.object_path.value)))
             with gui.add_folder('高级：掩膜、标定与支持点参数', expand_by_default=False):
-                gui.add_markdown('没有可靠标定时请留空，不编造内参、不重复去畸变。此处标定参数也供独立当前照片使用。')
+                gui.add_markdown('没有可靠标定时留空：将从图像与地图匹配估计并优化焦距，不把默认猜测值固定为标定。'
+                    '不会仅凭相同分辨率自动套用地图相机参数。已提供的标定/内参保持固定，不重复去畸变。'
+                    '此处标定参数也供独立当前照片使用；修改后应重新计算照片。')
+                self.query_camera_info = gui.add_text('本次查询采用的相机参数', '未求解。无标定时自动估计焦距。', multiline=True, disabled=True)
                 self.mask_path = gui.add_text('原尺寸特征排除掩膜（可选）', '')
                 self.cluster_radius = gui.add_number('聚类半径（地图单位；0 自动）', 0., min=0., step=.05)
                 self.minimum_points = gui.add_number('最少支持点数', 3, min=3, max=1000, step=1)
@@ -695,6 +700,8 @@ class ViewerApplication(PhotoSelectionControls, RouteWorkflowControls, PlaybackC
             self.query_result = None
             self.controller.clear('query')
             self.evidence_image.visible = False
+            self.query_camera_info.value = '未求解。无标定时自动估计焦距。'
+            self.reuse_query.value = False
             self._clear_photo_selection()
             for client in self.server.get_clients().values():
                 self._focus_map(client)
@@ -702,11 +709,14 @@ class ViewerApplication(PhotoSelectionControls, RouteWorkflowControls, PlaybackC
     def _locate_object(self, _):
         self._require_final()
         photo, roi = self._validated_selection()
+        reuse = self.reuse_query.value
+        if reuse and (not self.query_path.value.strip() or (self.query_result or {}).get('pose_status') != 'localized'):
+            raise ValueError('当前照片没有定位成功的证据可复用，请取消「复用已载入」后重新计算。')
         self._invalidate_target(clear_query=False)
         self.evidence_image.visible = False
         self._submit('locate_object', {'photo': photo,
             'roi': roi,
-            'query_dir': self.query_path.value.strip() or None, 'mask_path': self.mask_path.value.strip() or None,
+            'query_dir': self.query_path.value.strip() if reuse else None, 'mask_path': self.mask_path.value.strip() or None,
             'cluster_radius': float(self.cluster_radius.value) or None,
             'min_points': int(self.minimum_points.value), 'config': self._config()})
         self.roi_status.value = '已提交计算：当前绿框就是本次目标区域。调整选框将使本次计算不再作为当前结果。'
@@ -732,10 +742,12 @@ class ViewerApplication(PhotoSelectionControls, RouteWorkflowControls, PlaybackC
         self.query_path.value = str(directory)
         self._show_evidence(Path(directory))
         self.query_result = payload
+        self.query_camera_info.value = query_camera_notice(payload)
         if payload.get('pose_status') != 'localized':
             self.controller.clear('query')
             self.controller.clear('support')
-            self._message('Query failed: '+str(payload.get('failure_reason'))+'\n'+json.dumps(payload.get('quality', {})))
+            self.roi_status.value = query_failure_notice(payload, roi_retained=False)
+            self._message(self.roi_status.value+'\n诊断：'+str(payload.get('failure_reason')))
             return
         self.controller.load_query(payload)
         self._message('Query camera (NOT current pose): '+str(payload.get('pose_status'))+'\n'+json.dumps(payload.get('quality', {})))
@@ -765,14 +777,17 @@ class ViewerApplication(PhotoSelectionControls, RouteWorkflowControls, PlaybackC
             self.photo.value = str(self.target_photo)
             query_dir = Path(payload['query_dir'])
             self.load_query(query_dir)  # verifies evidence bindings before rendering
-            if self.query_result.get('pose_status') != 'localized':
-                raise ValueError('object_query_not_localized')
             evidence = read_json(query_dir/'query_evidence.json')
             from .evidence import digest_json
             binding = payload.get('roi_binding', {})
             if (binding.get('evidence_sha256') != evidence['evidence_sha256']
                     or digest_json(binding) != payload.get('roi_sha256')):
                 raise ValueError('object_evidence_binding_mismatch')
+            for key in ('map_id', 'map_hash'):
+                if payload.get(key) != self.controller.model[key]:
+                    raise ValueError('object_' + key + '_mismatch')
+            if self.query_result.get('pose_status') != 'localized' and payload.get('status') == 'supported':
+                raise ValueError('object_query_not_localized')
             from PIL import Image
             from .video import sha256_file
             source = Path(self.photo.value).resolve()
@@ -780,14 +795,20 @@ class ViewerApplication(PhotoSelectionControls, RouteWorkflowControls, PlaybackC
                 width, height = image.size
             self._select_roi({'path': source, 'sha256': sha256_file(source),
                               'width': width, 'height': height}, binding['roi'])
-            self.controller.load_object(payload, evidence)
             self._show_evidence(query_dir, roi=binding.get('roi'))
-            self.target_result = payload
-            self.roi_status.value = ('计算完成：目标已有三维支持。' if payload['status'] == 'supported'
-                                     else '计算结束，但目标证据不足；可重新打开原图调整选框。')
+            if self.query_result.get('pose_status') != 'localized':
+                self.roi_status.value = query_failure_notice(self.query_result)
+            else:
+                self.controller.load_object(payload, evidence)
+                self.target_result = payload if payload['status'] == 'supported' else None
+                self.roi_status.value = ('计算完成：照片已定位，框内目标已有三维支持。'
+                    '黄色点是可见表面证据，不是完整物体中心。' if self.target_result else
+                    object_failure_notice(payload))
+        else:
+            self.roi_status.value = '计算结束：未生成可用目标结果。原因：'+str(payload.get('failure_reason'))+'。请检查输入后重新计算。'
         self.object_path.value = str(path)
-        self._message('Object result: '+payload['status']+'; '+str(payload.get('failure_reason'))+
-                      '\n'+str(path)+'\nVisible surface support only; historical observations.')
+        details = ('\n诊断：'+str(payload['failure_reason'])) if payload.get('failure_reason') else ''
+        self._message(self.roi_status.value+details+'\n结果文件：'+str(path))
 
     def _plan_route(self, _):
         self._require_final()

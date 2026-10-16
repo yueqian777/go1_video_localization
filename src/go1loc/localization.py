@@ -176,7 +176,23 @@ def localize_photo(query_path: Path, map_dir: Path, output_dir: Path, config: Lo
         query_intrinsics_status = 'calibrated_rectified' if rectification is not None else 'explicit'
     else:
         camera = pycolmap.infer_camera_from_image(query_copy)
-        query_intrinsics_status = "inferred_or_approximate"
+        query_intrinsics_status = "self_estimated_not_calibrated"
+
+    # infer_camera_from_image supplies an initialization, not a calibration.
+    # PyCOLMAP otherwise fixes that guess during both RANSAC and refinement.
+    # Never copy a map camera just because the image dimensions happen to match.
+    estimate_focal = not (config.query_camera_model or rectification is not None)
+    pose_options = {
+        'estimation': {'estimate_focal_length': estimate_focal,
+                       'ransac': {'max_error': config.max_reprojection_px}},
+        'refinement': {'refine_focal_length': estimate_focal, 'refine_extra_params': False},
+    }
+    geometry['intrinsics_policy'] = {
+        'mode': 'estimate_focal_from_2d3d' if estimate_focal else 'fixed_supplied_intrinsics',
+        'initial_camera': {'model': camera.model.name, 'width': camera.width,
+                           'height': camera.height, 'params': camera.params.tolist()},
+        'pose_options': pose_options,
+    }
 
     retrieval = localize_sfm.parse_retrieval(query_pairs)
     db_ids = []
@@ -190,9 +206,7 @@ def localize_photo(query_path: Path, map_dir: Path, output_dir: Path, config: Lo
     candidates = []
     all_evidence = []
     started = time.perf_counter()
-    localizer = localize_sfm.QueryLocalizer(
-        model, {"estimation": {"ransac": {"max_error": config.max_reprojection_px}}}
-    )
+    localizer = localize_sfm.QueryLocalizer(model, pose_options)
     for index, cluster in enumerate(clusters):
         # Each estimator may refine its camera. Preserve the camera used by each pose.
         cluster_camera = pycolmap.Camera(camera.todict())
@@ -204,6 +218,8 @@ def localize_photo(query_path: Path, map_dir: Path, output_dir: Path, config: Lo
             local_query,
             query_matches,
         )
+        if not cluster_camera.verify_params() or not np.isfinite(cluster_camera.params).all():
+            raise PipelineInputError('invalid_estimated_query_camera_parameters')
         from hloc.utils.io import get_matches
         rows = export_rows(model, log, ret, cluster_camera,
                            lambda name: get_matches(query_matches, query_name, name))
@@ -219,6 +235,9 @@ def localize_photo(query_path: Path, map_dir: Path, output_dir: Path, config: Lo
         quality = _quality(ret, len(log.get("points3D_ids", [])))
         quality.update(row_diagnostics(rows, camera.width, camera.height))
         quality.update({"cluster_index": index, "retrieved_reference_count": len(cluster), "query_intrinsics": query_intrinsics_status})
+        quality['query_camera'] = all_evidence[-1]['camera']
+        quality['acceptance_thresholds'] = {'min_2d3d': config.min_2d3d, 'min_inliers': config.min_inliers,
+            'min_inlier_ratio': config.min_inlier_ratio, 'max_reprojection_px': config.max_reprojection_px}
         candidates.append({"ret": ret, "log": log, "quality": quality, "cluster_index": index})
     def finish(result, selected=None):
         result.map_hash = manifest['manifest_sha256']

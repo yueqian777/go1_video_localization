@@ -220,6 +220,42 @@ class LocalizationFlowTests(EvidenceWorkspace):
         self.assertEqual(backend.created_feature_confs[0]["model"]["max_keypoints"], 2048)
         self.assertEqual(backend.extractor.confs["superpoint_aachen"]["model"]["max_keypoints"], 4096)
 
+    def test_uncalibrated_query_estimates_focal_instead_of_fixing_initial_guess(self):
+        backend = FakeBackend()
+        backend.sfm.QueryLocalizer = Mock(side_effect=lambda model, config: NS(model=model, config=config))
+        result, output, _ = self.localize(backend)
+        options = backend.sfm.QueryLocalizer.call_args.args[1]
+        self.assertTrue(options['estimation']['estimate_focal_length'])
+        self.assertTrue(options['refinement']['refine_focal_length'])
+        self.assertFalse(options['refinement']['refine_extra_params'])
+        self.assertEqual(options['estimation']['ransac']['max_error'], 4.)
+        self.assertEqual(result.quality['query_intrinsics'], 'self_estimated_not_calibrated')
+        evidence = json.loads((output/'query_evidence.json').read_text(encoding='utf-8'))
+        policy = evidence['binding']['geometry']['intrinsics_policy']
+        self.assertEqual(policy['mode'], 'estimate_focal_from_2d3d')
+        self.assertEqual(result.quality['query_camera']['params'], backend.cluster_cameras[0].params.tolist())
+        self.assertEqual(result.quality['acceptance_thresholds']['min_inlier_ratio'], .25)
+
+    def test_calibration_and_explicit_intrinsics_are_not_refined(self):
+        for config in [LocalizationConfig(query_camera_model='PINHOLE', query_camera_params=[10, 10, 0, 0]),
+                       LocalizationConfig(calibration_path=self.calibration)]:
+            with self.subTest(config=config):
+                backend = FakeBackend()
+                backend.sfm.QueryLocalizer = Mock(side_effect=lambda model, config: NS(model=model, config=config))
+                self.localize(backend, config=config)
+                options = backend.sfm.QueryLocalizer.call_args.args[1]
+                self.assertFalse(options['estimation']['estimate_focal_length'])
+                self.assertFalse(options['refinement']['refine_focal_length'])
+                self.assertFalse(options['refinement']['refine_extra_params'])
+
+    def test_nonfinite_estimated_camera_never_emits_success_evidence(self):
+        backend = FakeBackend()
+        backend.camera_shift = float('nan')
+        output = self.output()
+        with self.assertRaisesRegex(PipelineInputError, 'invalid_estimated_query_camera_parameters'):
+            self.localize(backend, output=output)
+        self.assertFalse((output/'query_evidence.json').exists())
+
     def test_bad_camera_parameters_never_emit_success_evidence(self):
         config = LocalizationConfig(query_camera_model="PINHOLE", query_camera_params=[-1, 10, 0, 0])
         output = self.output()

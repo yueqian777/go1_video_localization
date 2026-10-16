@@ -42,9 +42,50 @@ def protocol_value(value, labels):
     return labels.get(value, value)
 
 
+def query_failure_notice(result, *, roi_retained=True):
+    quality = result.get('quality') or {}
+    reason = result.get('failure_reason') or result.get('pose_status') or 'unknown'
+    lines = ['计算结束：照片定位未通过，未生成目标三维位置。']
+    if 'inlier_ratio' in quality:
+        line = (f"有效匹配 {quality.get('num_inliers', '?')} / {quality.get('num_2d3d', '?')}，"
+                f"内点率 {quality['inlier_ratio']:.2%}")
+        threshold = quality.get('acceptance_thresholds', {}).get('min_inlier_ratio')
+        if threshold is not None:
+            line += f'（要求至少 {threshold:.2%}）'
+        lines.append(line + '。')
+    lines.append(ERRORS.get(reason, '原因：' + str(reason)))
+    lines.append(('选框已保留；' if roi_retained else '可重新打开原图框选；') +
+                 '检查照片、标定后重新计算，不会自动沿用本次失败结果。')
+    return '\n'.join(lines)
+
+
+def query_camera_notice(result):
+    quality = result.get('quality') or {}
+    source = quality.get('query_intrinsics')
+    label = {'self_estimated_not_calibrated': '由图像与地图匹配估计焦距（不是实测标定）',
+             'explicit': '采用手动输入的相机参数（固定）',
+             'calibrated_rectified': '采用标定及去畸变后的参数（固定）',
+             'inferred_or_approximate': '历史结果：使用近似参数，建议重新计算'}.get(source, '未记录相机参数来源')
+    camera = quality.get('query_camera') or {}
+    if camera:
+        label += '\n' + str(camera.get('model')) + '：' + str([round(float(x), 4) for x in camera.get('params', [])])
+    return label
+
+
+def object_failure_notice(result):
+    if result.get('failure_reason') == 'multiple_spatial_support_clusters':
+        return (f"计算结束：照片已定位，但框内存在多个三维候选（{len(result.get('candidates', []))} 组），未确定唯一目标。"
+                '选框可能混入背景或其他物体；请缩小选框到目标轮廓后重新计算。不会自动选择其中一组。')
+    return ('计算结束：照片已定位，但框内三维证据不足，未生成目标位置。'
+            '可调整选框或补拍有纹理、重叠视野的照片。')
+
+
 def human_status(value):
     """A short actionable notice; the complete original is kept in diagnostics."""
     text = str(value)
+    # Preserve structured result summaries even when raw diagnostic codes follow.
+    if text.startswith(('计算结束：', '计算完成：')):
+        return text.split('\n诊断：', 1)[0].split('\n结果文件：', 1)[0][:1200]
     for code, explanation in ERRORS.items():
         if code in text:
             return explanation
