@@ -18,7 +18,7 @@ import numpy as np
 from .input_safety import validate_image_path
 from .pipeline_errors import PipelineInputError, PipelineUnavailable
 from .schemas import LocalizationResult
-from .evidence import verify_map, export_rows, make_binding, row_diagnostics, write_json, digest_json, resolve_map_path
+from .evidence import verify_map, export_rows, make_binding, row_diagnostics, write_json, digest_json, resolve_map_path, QueryRowIndex
 from .query_geometry import prepare_query, original_coordinates
 
 
@@ -331,7 +331,8 @@ def localize_photo(query_path: Path, map_dir: Path, output_dir: Path, config: Lo
             raise PipelineInputError('invalid_query_camera_parameters')
         query_intrinsics_status = 'calibrated_rectified' if rectification is not None else 'explicit'
     else:
-        camera = pycolmap.infer_camera_from_image(query_copy)
+        camera = (resident.infer_initial_camera(query_copy) if hasattr(resident,'infer_initial_camera')
+                  else pycolmap.infer_camera_from_image(query_copy))
         query_intrinsics_status = "self_estimated_not_calibrated"
 
     # infer_camera_from_image supplies an initialization, not a calibration.
@@ -375,6 +376,7 @@ def localize_photo(query_path: Path, map_dir: Path, output_dir: Path, config: Lo
 
     cached_solver = (resident.cluster_solver(localizer, query_name, local_query, read_matches)
                      if hasattr(resident, 'cluster_solver') else None)
+    row_index = QueryRowIndex(model, read_matches)
 
     def solve(cluster, strategy='covisibility_component'):
         solve_started = time.perf_counter()
@@ -391,7 +393,7 @@ def localize_photo(query_path: Path, map_dir: Path, output_dir: Path, config: Lo
         if hasattr(resident, '_record_stage'):
             resident._record_stage('pnp_inputs_and_solve_s',solve_started,pose_candidates=1)
         export_started = time.perf_counter()
-        rows = export_rows(model, log, ret, cluster_camera, read_matches)
+        rows = export_rows(model, log, ret, cluster_camera, read_matches, row_index=row_index)
         raw_uv = original_coordinates([r['uv'] for r in rows], rectification)
         for row, uv in zip(rows, raw_uv):
             row['uv_original'] = uv.tolist()
@@ -415,6 +417,9 @@ def localize_photo(query_path: Path, map_dir: Path, output_dir: Path, config: Lo
         return {"ret": ret, "log": log, "quality": quality, "cluster_index": index,
                 'camera': cluster_camera, 'rows': rows}
 
+    if (reference_names is not None and not db_global and getattr(resident,'device',None)=='cuda'
+            and hasattr(resident,'prefetch_global_matches')):
+        resident.prefetch_global_matches([n for n in ref_image_names if n != query_name])
     for cluster in clusters:
         candidate = solve(cluster)
         if candidate:
@@ -428,6 +433,11 @@ def localize_photo(query_path: Path, map_dir: Path, output_dir: Path, config: Lo
         geometry['reference_consensus_policy'] = {**REFERENCE_CONSENSUS_POLICY, 'top_k': config.top_k}
     def finish(result, selected=None):
         finish_started = time.perf_counter()
+        # Once the local decision is successful, no global match can be used.
+        # Stop speculative GPU work before CPU evidence serialization/verification.
+        if (reference_names is not None and result.pose_status=='localized'
+                and hasattr(resident,'_finish_match_prefetch')):
+            resident._finish_match_prefetch(cancel=True)
         result.map_hash = manifest['manifest_sha256']
         result.capture_time = config.capture_time
         result.localization_time = datetime.now(timezone.utc).isoformat()

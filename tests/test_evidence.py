@@ -52,6 +52,46 @@ class EvidenceTests(unittest.TestCase):
         args = list(self.fixture()); args[2] = None
         self.assertFalse(any(r['pnp_inlier'] for r in export_rows(*args)))
 
+    def test_query_bound_row_index_reuses_only_lookup_not_pose_or_rows(self):
+        from unittest.mock import Mock
+        from go1loc.evidence import QueryRowIndex
+        model, log, ret, camera, matches = self.fixture()
+        reader = Mock(side_effect=matches)
+        index = QueryRowIndex(model, reader)
+        expected = export_rows(model, log, ret, camera, matches)
+        first = export_rows(model, log, ret, camera, reader, row_index=index)
+        self.assertEqual(first, expected)
+        first[0]['references'][0]['match_score'] = -999
+        ret2 = copy.deepcopy(ret); ret2['inlier_mask'] = [False, True]
+        for pose in (ret2, None, ret):
+            self.assertEqual(export_rows(model, log, pose, camera, reader, row_index=index),
+                             export_rows(model, log, pose, camera, matches))
+        self.assertEqual(reader.call_count, 1)
+        wrong = copy.deepcopy(log); wrong['keypoint_index_to_db'][1][0] = (8, [0])
+        with self.assertRaisesRegex(ValueError, 'point_id_alignment'):
+            export_rows(model, wrong, ret, camera, reader, row_index=index)
+        different = lambda name: (matches(name)[0], np.array([.1, .2]))
+        with self.assertRaisesRegex(ValueError, 'row_index_binding'):
+            export_rows(model, log, ret, camera, different, row_index=index)
+        new_index = QueryRowIndex(model, different)
+        self.assertEqual(export_rows(model, log, ret, camera, different, row_index=new_index),
+                         export_rows(model, log, ret, camera, different))
+        with self.assertRaisesRegex(ValueError, 'row_index_binding'):
+            export_rows(copy.copy(model), log, ret, camera, reader, row_index=index)
+
+    def test_row_index_keeps_duplicate_match_and_score_validation(self):
+        from go1loc.evidence import QueryRowIndex
+        model, log, ret, camera, matches = self.fixture()
+        pairs, scores = matches('ref.jpg')
+        duplicate = lambda name: (np.concatenate([pairs, pairs[1:]]), np.r_[scores, .4])
+        index = QueryRowIndex(model, duplicate)
+        self.assertEqual(export_rows(model, log, ret, camera, duplicate, row_index=index),
+                         export_rows(model, log, ret, camera, duplicate))
+        self.assertEqual(index.lookup(42)[(17, 9)], (1, .4))
+        invalid = lambda name: (pairs, scores[:1])
+        with self.assertRaisesRegex(ValueError, 'match_score_length'):
+            export_rows(model, log, ret, camera, invalid, row_index=QueryRowIndex(model, invalid))
+
     def test_map_tampering_detected(self):
         with tempfile.TemporaryDirectory() as d:
             root = Path(d); sfm = root/'sfm'; sfm.mkdir()

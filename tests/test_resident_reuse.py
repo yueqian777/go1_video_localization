@@ -22,13 +22,30 @@ from go1loc.navigation_localizer import ResidentLocalizer
 @unittest.skipUnless(VISION_AVAILABLE,'requires the optional pinned hloc/vision environment')
 class ReuseTests(unittest.TestCase):
     def test_frozen_cluster_cache_preserves_order_and_returns_independent_lists(self):
-        b=self.backend();b.reconstruction=object()
-        with patch('hloc.localize_sfm.do_covisibility_clustering',side_effect=lambda ids,model:[ids]) as compute:
-            a=b.covisibility_clusters([3,1]);a[0].append(9)
-            self.assertEqual(b.covisibility_clusters([3,1]),[[3,1]])
-            self.assertEqual(compute.call_count,1)
-            self.assertEqual(b.covisibility_clusters([1,3]),[[1,3]])
-            self.assertEqual(compute.call_count,2)
+        from hloc.localize_sfm import do_covisibility_clustering
+        from itertools import permutations
+        observed=[]
+        class Points(list):
+            def __iter__(self):
+                observed.append(1)
+                return super().__iter__()
+        tracks={10:[1,3],20:[3,9],30:[21]}
+        def reconstruction(count):
+            return SimpleNamespace(images={n:SimpleNamespace(points2D=(Points if count else list)(
+                [SimpleNamespace(point3D_id=p,has_point3D=lambda:True)
+                 for p, ids in tracks.items() if n in ids])) for n in [1,3,9,21]},
+                points3D={p:SimpleNamespace(track=SimpleNamespace(elements=[SimpleNamespace(image_id=n)
+                    for n in ids])) for p,ids in tracks.items()})
+        b=self.backend();b.reconstruction=reconstruction(True)
+        reference=reconstruction(False)
+        for ids in ([3,1],[1,3],[9,1],[21],*permutations([1,3,9,21])):
+            expected=do_covisibility_clustering(list(ids),reference)
+            actual=b.covisibility_clusters(list(ids))
+            self.assertEqual(actual,expected)
+            actual[0].append(-999)
+            self.assertEqual(b.covisibility_clusters(list(ids)),expected)
+        # New subsets and permutations must not walk frozen tracks repeatedly.
+        self.assertEqual(len(observed),4)
 
     def test_identical_pnp_input_still_invokes_estimator_without_sharing_refined_camera(self):
         from go1loc.localization import _CachedClusterSolver
@@ -51,6 +68,22 @@ class ReuseTests(unittest.TestCase):
         cc=FakeCamera();cc.params[0]=11;b(cc,[1]);self.assertEqual(len(calls),3)
         localizer.config={'estimation':{'ransac':{'max_error':3}}}
         b(FakeCamera(),[1]);self.assertEqual(len(calls),4)
+
+    def test_initial_camera_reuse_is_per_original_bytes_and_never_refined_pose(self):
+        import pycolmap
+        b=self.backend()
+        camera=pycolmap.Camera(model='PINHOLE',width=8,height=8,params=[10,10,4,4])
+        with TemporaryDirectory() as temp, patch('pycolmap.infer_camera_from_image',return_value=camera) as infer:
+            p=Path(temp);a=p/'a.png';c=p/'c.png';a.write_bytes(b'same');c.write_bytes(b'same')
+            with b.query_reuse():
+                first=b.infer_initial_camera(a);first.params[0]=99
+                second=b.infer_initial_camera(c)
+                self.assertEqual(second.params[0],10)
+                self.assertEqual(infer.call_count,1)
+                c.write_bytes(b'changed');b.infer_initial_camera(c)
+                self.assertEqual(infer.call_count,2)
+            with b.query_reuse():b.infer_initial_camera(a)
+            self.assertEqual(infer.call_count,3)
     def test_cached_cluster_inputs_match_pinned_hloc_including_ambiguous_indices(self):
         from hloc.localize_sfm import pose_from_cluster
         from go1loc.localization import _CachedClusterSolver
@@ -153,6 +186,89 @@ class ReuseTests(unittest.TestCase):
                     with b.query_reuse():pass
                 raise RuntimeError('test failure')
         self.assertIsNone(b._query_reuse)
+
+    def test_prefetch_joins_before_global_matching_and_does_not_cross_queries(self):
+        import threading
+        b=self.backend()
+        data=dict(keypoints=np.ones((2,2),np.float16),descriptors=np.ones((4,2),np.float16),
+                  scores=np.ones(2,np.float16),image_size=np.array([8,8]))
+        b.reference_features={n:data for n in ['a','b','c']}
+        entered,release=threading.Event(),threading.Event()
+        original=b._model(None,None)
+        def gated(inputs):
+            if threading.current_thread().name=='localization-match-prefetch':
+                entered.set()
+                if not release.wait(5): raise RuntimeError('test_release_timeout')
+            return original(inputs)
+        b._model=lambda *args:gated
+        with TemporaryDirectory() as temp:
+            p=Path(temp);features=p/'features.h5';pairs=p/'pairs.txt'
+            with h5py.File(features,'w') as f:
+                for k,v in data.items():f.create_dataset('q/'+k,data=v)
+            def match(name, refs):
+                pairs.write_text(''.join('q '+r+'\n' for r in refs))
+                b.match({'model':{'name':'lightglue'}},pairs,features=features,
+                        features_ref=p/'unused',matches=p/name,overwrite=True)
+            with b.query_reuse():
+                match('local.h5',['a'])
+                self.assertTrue(b.prefetch_global_matches(['a','b','c']))
+                try:
+                    self.assertTrue(entered.wait(5))
+                    self.assertEqual(len(b.calls),1)  # main thread can continue PnP work
+                finally:release.set()
+                match('global.h5',['a','b','c'])
+                self.assertIsNone(b._match_prefetch)
+                self.assertEqual(len(b.calls),3)
+                self.assertEqual(b.last_profile['prefetch_match_pairs'],2)
+                with h5py.File(p/'global.h5') as f:
+                    np.testing.assert_equal(f['q/b/matches0'][:],[0,1])
+                # Even if prefetch completed, changed filtered query arrays miss the cache.
+                with h5py.File(features,'a') as f:f['q/keypoints'][0]=[9,9]
+                match('changed.h5',['b']);self.assertEqual(len(b.calls),4)
+            with b.query_reuse():
+                self.assertFalse(b.prefetch_global_matches(['b']))
+                match('new_query.h5',['b']);self.assertEqual(len(b.calls),5)
+
+    def test_prefetch_error_cleans_up_and_is_not_a_silent_match_success(self):
+        import threading
+        b=self.backend()
+        def broken(ref): raise ValueError('matcher_failed')
+        with self.assertRaisesRegex(RuntimeError,'prefetch_failed'):
+            with b.query_reuse():
+                b._match_context=(('fingerprint','configuration'),broken)
+                self.assertTrue(b.prefetch_global_matches(['a']))
+                b._finish_match_prefetch(cancel=False)
+        self.assertIsNone(b._match_prefetch)
+        self.assertIsNone(b._query_reuse)
+        self.assertFalse(any(t.name=='localization-match-prefetch' for t in threading.enumerate()))
+
+    def test_local_success_cancels_and_joins_prefetch_inside_recorded_total(self):
+        import threading
+        b=self.backend();entered=threading.Event();release=threading.Event();computed=[]
+        def predict(ref):
+            entered.set()
+            if not release.wait(5):raise RuntimeError('test_release_timeout')
+            computed.append(ref)
+            return {}
+        def localize(*args):
+            b._match_context=(('q','conf'),predict)
+            b.prefetch_global_matches(['a','b','c'])
+            self.assertTrue(entered.wait(5))
+            cancel=b._match_prefetch['cancel']
+            def release_after_cancel():
+                cancel.wait(5);release.set()
+            helper=threading.Thread(target=release_after_cancel)
+            helper.start()
+            b.helper=helper
+            return 'localized'
+        b._localize=localize
+        self.assertEqual(b.localize(Path('photo'),Path('out')),'localized')
+        b.helper.join(5)
+        self.assertEqual(computed,['a'])
+        self.assertIsNone(b._match_prefetch)
+        self.assertIsNone(b._query_reuse)
+        self.assertGreaterEqual(b.last_profile['total_s'],b.last_profile['prefetch_wait_s'])
+        self.assertEqual(b.last_profile['match_pairs'],1)
 
     def test_local_and_global_attempt_share_only_one_transaction(self):
         b=self.backend();b.manifest={'manifest_sha256':'map'};b.map_dir=Path('map')

@@ -43,6 +43,7 @@ class ResidentLocalizer:
                 if size > 1024**3:
                     raise ValueError('resident_feature_cache_over_1GiB')
                 self.reference_features[im.name] = data
+        self._prime_covisibility()
 
     def verified_manifest(self, map_dir):
         if Path(map_dir).resolve() != self.map_dir:
@@ -90,12 +91,20 @@ class ResidentLocalizer:
         if getattr(self, '_query_reuse', None) is not None:
             raise RuntimeError('overlapping_resident_queries')
         self._query_reuse = {'features': {}, 'matches': {}}
+        self._match_context = None
+        self._match_prefetch = None
+        self._initial_cameras = {}
         self.last_profile = dict(extract_s=0., match_s=0., extractions=0,
                                  extraction_reuses=0, match_pairs=0, match_reuses=0)
         try:
             yield
         finally:
-            self._query_reuse = None
+            try:
+                self._finish_match_prefetch(cancel=True)
+            finally:
+                self._query_reuse = None
+                self._match_context = None
+                self._initial_cameras = {}
 
     def _record_stage(self, stage, started, **counts):
         profile = getattr(self, 'last_profile', None)
@@ -108,20 +117,60 @@ class ResidentLocalizer:
         from .localization import _CachedClusterSolver
         return _CachedClusterSolver(localizer, query_name, features, read_matches)
 
+    def infer_initial_camera(self, photo):
+        """Reuse only the file-derived initial guess, never a PnP refinement."""
+        import pycolmap
+        started = time.perf_counter()
+        cache = getattr(self,'_initial_cameras',{}) if getattr(self,'_query_reuse',None) is not None else {}
+        key = sha256_file(photo)
+        reused = key in cache
+        if not reused: cache[key] = pycolmap.infer_camera_from_image(photo).todict()
+        camera = pycolmap.Camera(deepcopy(cache[key]))
+        self._record_stage('initial_camera_s',started,initial_camera_reuses=int(reused))
+        return camera
+
+    def _prime_covisibility(self):
+        # Run once before taking current frames, like model warmup. Keep the
+        # very same sets hloc constructs, without sorting/reordering their IDs.
+        if not hasattr(self, '_covisibility_neighbors'):
+            self._covisibility_neighbors = {
+                image_id: {obs.image_id for point in image.points2D if point.has_point3D()
+                           for obs in self.reconstruction.points3D[point.point3D_id].track.elements}
+                for image_id, image in self.reconstruction.images.items()}
+
     def covisibility_clusters(self, image_ids):
-        # Connectivity belongs to the verified frozen map, not the query.
-        # Preserve even the input order because it defines correspondence order.
-        from hloc.localize_sfm import do_covisibility_clustering
+        """Pinned hloc c13273b BFS, reusing only frozen-map adjacency sets.
+
+        Preserve the upstream set operations, traversal and stable size sort:
+        changing correspondence order would change the random PnP stream.
+        Adapted from Apache-2.0 hloc; see THIRD_PARTY_NOTICES.md.
+        """
+        self._prime_covisibility()
         if not hasattr(self,'_cluster_cache'):self._cluster_cache={}
         key=tuple(image_ids)
         if key not in self._cluster_cache:
             if len(self._cluster_cache)>=32:self._cluster_cache.pop(next(iter(self._cluster_cache)))
-            self._cluster_cache[key]=do_covisibility_clustering(image_ids,self.reconstruction)
+            clusters, visited = [], set()
+            selected = set(image_ids)
+            for image_id in image_ids:
+                if image_id in visited: continue
+                clusters.append([])
+                queue = {image_id}
+                while queue:
+                    current = queue.pop()
+                    if current in visited: continue
+                    visited.add(current)
+                    clusters[-1].append(current)
+                    connected = self._covisibility_neighbors[current] & selected
+                    connected -= visited
+                    queue |= connected
+            self._cluster_cache[key]=sorted(clusters,key=len,reverse=True)
         return deepcopy(self._cluster_cache[key])
 
     def extract(self, conf, image_dir, export_dir, *, image_list, feature_path, overwrite):
         import torch, h5py
         from hloc import extractors
+        self._finish_match_prefetch(cancel=False)
         model = self._model(extractors,conf['model'])
         dataset = self.extract_module.ImageDataset(image_dir,conf['preprocessing'],image_list)
         started = time.perf_counter(); computed = reused = 0
@@ -157,6 +206,9 @@ class ResidentLocalizer:
         import torch, h5py
         from hloc import matchers
         from hloc.utils.parsers import parse_retrieval, names_to_pair
+        # Only one GPU model call at a time. Wait for the same-query speculative
+        # matches before extraction/matching can use the model again.
+        self._finish_match_prefetch(cancel=False)
         model = self._model(matchers,conf['model'])
         started = time.perf_counter(); computed = reused = 0
         cache = getattr(self, '_query_reuse', None)
@@ -175,20 +227,77 @@ class ResidentLocalizer:
                     fingerprint.update(v.tobytes())
                 query_key = (fingerprint.hexdigest(),json.dumps(conf,sort_keys=True))
                 query_tensors = tensors(qdata,'0')
+                def predict(ref):
+                    pred = model({**query_tensors,**tensors(self.reference_features[ref],'1')})
+                    prediction = {'matches0':pred['matches0'][0].cpu().short().numpy()}
+                    if 'matching_scores0' in pred:
+                        prediction['matching_scores0'] = pred['matching_scores0'][0].cpu().half().numpy()
+                    return prediction
                 for ref in refs:
                     key = (query_key,ref)
                     if key in cache:
                         prediction = cache[key]; reused += 1
                     else:
-                        pred = model({**query_tensors,**tensors(self.reference_features[ref],'1')})
-                        prediction = {'matches0':pred['matches0'][0].cpu().short().numpy()}
-                        if 'matching_scores0' in pred:
-                            prediction['matching_scores0'] = pred['matching_scores0'][0].cpu().half().numpy()
+                        prediction = predict(ref)
                         cache[key] = prediction; computed += 1
                     group = mf.create_group(names_to_pair(q,ref))
                     for k,v in prediction.items():group.create_dataset(k,data=v)
+                if getattr(self, '_query_reuse', None) is not None:
+                    self._match_context = (query_key, predict)
         self._record_stage('match_s',started,match_pairs=computed,match_reuses=reused)
         return matches
+
+    def prefetch_global_matches(self, reference_names):
+        """Overlap global GPU matches with local recovery on CPU, one query only.
+
+        Called only during a local attempt on an exhaustive frozen map. Cancel
+        remaining work if local recovery succeeds. No second model, no PnP
+        thread, no speculative pose result.
+        The same filtered-array fingerprint is checked by the later match().
+        """
+        context = getattr(self, '_match_context', None)
+        cache = getattr(self, '_query_reuse', None)
+        if context is None or cache is None or getattr(self,'_match_prefetch',None):
+            return False
+        query_key, predict = context
+        cache = cache['matches']
+        refs = [n for n in reference_names if (query_key,n) not in cache]
+        if not refs: return False
+        state = dict(cancel=threading.Event(), computed=0, error=None)
+        def run():
+            import torch
+            started = time.perf_counter()
+            try:
+                with torch.inference_mode():
+                    for ref in refs:
+                        if state['cancel'].is_set(): break
+                        cache[(query_key,ref)] = predict(ref)
+                        state['computed'] += 1
+            except Exception as exc:
+                state['error'] = exc
+            finally:
+                state['elapsed_s'] = time.perf_counter()-started
+        state['thread'] = threading.Thread(target=run,name='localization-match-prefetch',daemon=True)
+        self._match_prefetch = state
+        try:
+            state['thread'].start()
+        except Exception:
+            self._match_prefetch = None
+            raise
+        return True
+
+    def _finish_match_prefetch(self, *, cancel):
+        state = getattr(self,'_match_prefetch',None)
+        if state is None: return
+        if cancel: state['cancel'].set()
+        started = time.perf_counter()
+        state['thread'].join()  # No detached work can leak into the next query.
+        self._match_prefetch = None
+        self._record_stage('prefetch_wait_s',started,
+            prefetch_match_pairs=state['computed'],match_pairs=state['computed'],
+            prefetch_s=state['elapsed_s'])
+        if state['error'] is not None:
+            raise RuntimeError('resident_match_prefetch_failed') from state['error']
 
     def localize(self, photo, output, config=None):
         with self.query_reuse():
@@ -196,7 +305,10 @@ class ResidentLocalizer:
             try:
                 return self._localize(photo, output, config)
             finally:
-                self.last_profile['total_s'] = time.perf_counter()-started
+                try:
+                    self._finish_match_prefetch(cancel=True)
+                finally:
+                    self.last_profile['total_s'] = time.perf_counter()-started
 
     def _localize(self, photo, output, config=None):
         from .localization import localize_photo

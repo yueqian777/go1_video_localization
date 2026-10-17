@@ -131,6 +131,26 @@ class FakeBackend:
 
 
 class LocalizationFlowTests(EvidenceWorkspace):
+    def test_local_success_stops_speculative_gpu_before_serializing_evidence(self):
+        from go1loc.evidence import make_binding
+        for inliers in (6,2):
+            with self.subTest(inliers=inliers):
+                backend=FakeBackend(inliers=inliers);events=[]
+                resident=NS(device='cuda',reconstruction=backend.model,
+                    verified_manifest=lambda _:self.manifest,extract=backend.extract,match=backend.match,
+                    prefetch_global_matches=lambda refs:events.append('prefetch'),
+                    _finish_match_prefetch=lambda **kwargs:events.append(('cancel',kwargs['cancel'])))
+                def bind(*args,**kwargs):
+                    events.append('binding')
+                    return make_binding(*args,**kwargs)
+                with backend.installed(),patch('go1loc.localization.make_binding',side_effect=bind):
+                    result=localize_photo(self.photo,self.map_dir,self.output(),resident=resident,
+                        reference_names=[im.name for im in backend.images.values()])
+                if result.pose_status=='localized':
+                    self.assertEqual(events,['prefetch',('cancel',True),'binding'])
+                else:
+                    self.assertEqual(events,['prefetch','binding'])
+
     def localize(self, backend=None, *, config=None, output=None):
         backend = backend or FakeBackend()
         output = output or self.output()

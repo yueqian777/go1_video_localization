@@ -1,13 +1,17 @@
 # Third-party notices
 
 The input-assembly logic in `src/go1loc/localization.py::_CachedClusterSolver`
-is adapted from `hloc/localize_sfm.py::pose_from_cluster` in
+and frozen-adjacency traversal in
+`src/go1loc/navigation_localizer.py::ResidentLocalizer.covisibility_clusters`
+are adapted from `hloc/localize_sfm.py::pose_from_cluster` and
+`hloc/localize_sfm.py::do_covisibility_clustering` in
 [Hierarchical Localization (hloc)](https://github.com/cvg/Hierarchical-Localization),
 pinned revision `c13273bd0ecc2917a35910fd843712a1c6243193`.
 
 That upstream code is licensed under the Apache License, Version 2.0; a copy is
 included at `third_party_licenses/hloc-Apache-2.0.txt`.
-Local modifications introduce per-query reuse of input reads and index assembly;
+Local modifications introduce per-query reuse of input reads and index assembly,
+and precomputed frozen adjacency with the same set traversal and stable size sort;
 they preserve the upstream coordinate convention, correspondence order, estimator
 calls, and evidence-index relationships. This does not imply upstream endorsement.
 

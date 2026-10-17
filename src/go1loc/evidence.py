@@ -66,7 +66,36 @@ def make_binding(photo, manifest, files, geometry):
                       for name, path in files.items() if path is not None}}
 
 
-def export_rows(model, log, ret, camera, match_provider):
+class QueryRowIndex:
+    """Immutable reference/match join for ONE query attempt and frozen model.
+
+    Pose, camera, masks, projections and exported rows are never cached. The
+    provider is the attempt-local immutable HDF reader, not a cross-frame key.
+    """
+    def __init__(self, model, match_provider):
+        self.model = model
+        self.match_provider = match_provider
+        self.tables = {}
+        self.names = {}
+
+    def lookup(self, db_id):
+        if db_id not in self.tables:
+            ref = self.model.images[db_id]
+            matches, scores = self.match_provider(ref.name)
+            if len(matches) != len(scores):
+                raise ValueError('evidence_match_score_length_mismatch')
+            points = ref.points2D
+            table = {}
+            for (qidx, ridx), score in zip(matches, scores):
+                point = points[int(ridx)]
+                if point.has_point3D():
+                    table[(int(qidx), int(point.point3D_id))] = (int(ridx), float(score))
+            self.tables[db_id] = table
+            self.names[db_id] = ref.name
+        return self.tables[db_id]
+
+
+def export_rows(model, log, ret, camera, match_provider, *, row_index=None):
     """Pinned hloc c13273b: log DB indices are local offsets into log['db'].
 
     Stored uv is zero-based image pixel-center coordinates (OpenCV/hloc).
@@ -91,18 +120,10 @@ def export_rows(model, log, ret, camera, match_provider):
         projected = np.asarray(camera.img_from_cam(camera_xyz))
         errors = np.linalg.norm(projected - uv_colmap, axis=1)
     # Match scores belong to explicit (query index, reference index) pairs.
-    lookup = {}
-    for db_id in log['db']:
-        ref = model.images[int(db_id)]
-        matches, scores = match_provider(ref.name)
-        if len(matches) != len(scores):
-            raise ValueError('evidence_match_score_length_mismatch')
-        table = {}
-        for (qidx, ridx), score in zip(matches, scores):
-            p = ref.points2D[int(ridx)]
-            if p.has_point3D():
-                table[(int(qidx), int(p.point3D_id))] = (int(ridx), float(score))
-        lookup[int(db_id)] = table
+    row_index = row_index if row_index is not None else QueryRowIndex(model, match_provider)
+    if row_index.model is not model or row_index.match_provider is not match_provider:
+        raise ValueError('evidence_row_index_binding_mismatch')
+    lookup = {int(db_id): row_index.lookup(int(db_id)) for db_id in log['db']}
     rows = []
     for i, (pid, qidx, association) in enumerate(zip(ids, query_indices, associations)):
         if int(association[0]) != int(pid):
@@ -116,7 +137,7 @@ def export_rows(model, log, ret, camera, match_provider):
             if key not in lookup[db_id]:
                 raise ValueError('evidence_match_pair_not_found')
             ridx, score = lookup[db_id][key]
-            references.append({'image_id': db_id, 'image_name': model.images[db_id].name,
+            references.append({'image_id': db_id, 'image_name': row_index.names[db_id],
                                'reference_keypoint_index': ridx,
                                'match_score': score if np.isfinite(score) else None})
         rows.append({'correspondence_index': i, 'query_keypoint_index': int(qidx),
