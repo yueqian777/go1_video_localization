@@ -424,8 +424,11 @@ def localize_photo(query_path: Path, map_dir: Path, output_dir: Path, config: Lo
         candidate = solve(cluster)
         if candidate:
             candidates.append(candidate)
+    # One eligibility rule for recovery, normal selection and ambiguity. Rejected
+    # hypotheses remain in all_evidence, but cannot outvote a qualified pose.
+    qualified = [c for c in candidates if _passes_quality(c['quality'], config)]
     recovery = []
-    if not any(_passes_quality(c['quality'], config) for c in candidates):
+    if not qualified:
         recovery_started = time.perf_counter()
         recovery = _reference_consensus_candidates(clusters, all_evidence, solve, config)
         if hasattr(resident, '_record_stage'):
@@ -476,21 +479,26 @@ def localize_photo(query_path: Path, map_dir: Path, output_dir: Path, config: Lo
             result = LocalizationResult.failure(query_id=query_name, map_id=map_id, reason='ambiguous_reference_consensus')
             result.quality = {'best': best['quality'], 'alternatives': [c['quality'] for c in alternatives]}
             return finish(result, best['cluster_index'])
-        candidates = [best]
-    if not candidates:
+        qualified = [best]
+    if not qualified and not candidates:
         result = LocalizationResult.failure(query_id=query_name, map_id=map_id, reason="insufficient_pnp_evidence")
         result.quality = {"retrieved_reference_count": len(db_ids), "candidate_clusters": len(clusters)}
         return finish(result)
-    candidates.sort(key=lambda c: c["quality"]["num_inliers"], reverse=True)
-    best = candidates[0]
-    quality = best["quality"]
-    if quality["num_2d3d"] < config.min_2d3d or quality["num_inliers"] < config.min_inliers or quality["inlier_ratio"] < config.min_inlier_ratio:
+    if not qualified:
+        # Preserve the best rejected hypothesis as diagnostic selected_cluster,
+        # as before; failure results never expose it as a localized pose.
+        best = max(candidates, key=lambda c: c['quality']['num_inliers'])
         result = LocalizationResult.failure(query_id=query_name, map_id=map_id, reason="insufficient_pnp_quality")
-        result.quality = quality
+        result.quality = best['quality']
         return finish(result, best['cluster_index'])
-    if len(candidates) > 1 and candidates[1]["quality"]["num_inliers"] >= 0.9 * quality["num_inliers"]:
+    qualified.sort(key=lambda c: c["quality"]["num_inliers"], reverse=True)
+    best = qualified[0]
+    quality = best['quality']
+    # Only gate-passing solutions compete, with the unchanged 90% rule. A large
+    # outlier-heavy cluster is retained for audit, not an ambiguity veto.
+    if len(qualified) > 1 and qualified[1]["quality"]["num_inliers"] >= 0.9 * quality["num_inliers"]:
         result = LocalizationResult.failure(query_id=query_name, map_id=map_id, reason="ambiguous_multiple_covisibility_clusters")
-        result.quality = {"best": quality, "alternatives": [c["quality"] for c in candidates[1:]]}
+        result.quality = {"best": quality, "alternatives": [c["quality"] for c in qualified[1:]]}
         return finish(result, best['cluster_index'])
     component_id = None
     best_image_ids = set(all_evidence[best['cluster_index']]['reference_image_ids'])
