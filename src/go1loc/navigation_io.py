@@ -16,15 +16,37 @@ from .route_workflow import route_inputs
 from .video import sha256_file
 
 
-def prepare_index(map_dir, sidecar, declaration):
+def prepare_index(map_dir, sidecar, declaration, *, publish=True):
     from .events import outside_artifacts
     sidecar=outside_artifacts(Path(sidecar).resolve(),Path(map_dir).resolve())
-    manifest,refs,frames=route_inputs(map_dir)
+    manifest,refs,frames,model=route_inputs(map_dir,with_model=True)
     if not frames:
         raise ValueError('continuous_video_metadata_required')
     graph=build_navigation_index(manifest,refs,frames,declaration)
-    atomic_json(sidecar/'navigation_index.json',graph)
+    from .junctions import fuse_junctions, native_junction_observations
+    graph=fuse_junctions(graph,native_junction_observations(model,graph))
+    if publish:
+        save_navigation_index(sidecar,map_dir,graph)
     return graph
+
+
+def save_navigation_index(sidecar,map_dir,graph):
+    """Retain old revisions; only the latest sidecar pointer is replaced."""
+    from .events import outside_artifacts
+    sidecar=outside_artifacts(Path(sidecar).resolve(),Path(map_dir).resolve())
+    latest=sidecar/'navigation_index.json'
+    versions=[read_json(latest),graph] if latest.is_file() else [graph]
+    for version in versions:
+        digest=version.get('index_sha256')
+        if digest_json({k:v for k,v in version.items() if k!='index_sha256'})!=digest:
+            raise ValueError('navigation_index_hash_mismatch')
+        archived=sidecar/'indexes'/(digest+'.json')
+        if archived.exists():
+            if read_json(archived)!=version:
+                raise ValueError('navigation_index_archive_conflict')
+        else:
+            atomic_json(archived,version)
+    atomic_json(latest,graph)
 
 
 def observation_goals(model, graph, target):

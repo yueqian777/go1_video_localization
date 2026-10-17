@@ -36,6 +36,10 @@ def build_navigation_index(manifest, references, frames, declaration):
     rows = frames.get('frames', [])
     nodes = graph['nodes']
     names = [Path(r.get('image_path') or '').name for r in rows]
+    for name,row in zip(names,rows):
+        if name in nodes:
+            nodes[name]['capture_source']={k:row.get(k,frames.get(k)) for k in ('camera_id','session_id')}
+    traversal=0
     lengths = [float(np.linalg.norm(position(nodes[b]['T_MC'])-position(nodes[a]['T_MC'])))
                for a, b in zip(names, names[1:]) if a in nodes and b in nodes]
     step = float(np.median([x for x in lengths if x > 1e-5])) if any(x > 1e-5 for x in lengths) else 1.
@@ -74,12 +78,14 @@ def build_navigation_index(manifest, references, frames, declaration):
                 reasons.append('pose_rotation_jump')
         if reasons:
             graph['exceptions'].append(dict(from_frame=a, to_frame=b, reasons=sorted(set(reasons))))
+            traversal+=1
             continue
         eid = f'auto:{i}'
         edge = dict(edge_id=eid, **{'from': a, 'to': b}, enabled=True,
             path=[Ta[:3,3].tolist(), Tb[:3,3].tolist()], length=length, cost=length,
             units=graph['units'], observation_only=length < step*.08,
             provenance=dict(kind='automatic_recorded_traversal', frame_names=[a,b],
+                traversal_id=f'traversal:{traversal}',
                 pts_interval_s=[ra['pts_time_s'],rb['pts_time_s']],
                 source_sha256=frames.get('probe', {}).get('source_sha256'),
                 source_kind=frames.get('source_kind', 'original_video_kind_unspecified'),
@@ -126,6 +132,8 @@ def associate_route(graph, observation, previous=None):
     pose = _rigid(observation['T_WC_query']); p = pose[:3,3]
     step = graph['typical_step']; candidates = []
     for eid, edge in graph['edges'].items():
+        if not edge['enabled'] or edge.get('provenance',{}).get('kind')=='automatic_repeat_place':
+            continue
         a, b = np.asarray(edge['path'], float)
         v = b-a; size = float(v@v)
         t = float(np.clip((p-a)@v/max(size,1e-12),0,1))
@@ -148,6 +156,9 @@ def associate_route(graph, observation, previous=None):
     for other in candidates[1:]:
         e1, e2 = (graph['edges'][c['edge_id']] for c in (best,other))
         adjacent = bool({e1['from'],e1['to']} & {e2['from'],e2['to']})
+        if not adjacent:
+            from .junctions import edges_meet_at_junction
+            adjacent=edges_meet_at_junction(graph,e1,e2,p)
         if not adjacent and other['score']-best['score'] < .2:
             return {'status':'ambiguous_branch', 'candidates':candidates[:3]}
     return {**best, 'status':'associated', 'candidates':candidates[:3],
@@ -177,7 +188,12 @@ def plan_guidance(graph, association, goals, closed=()):
     path = [association['projection'], edge['path'][-1]]
     for peid in edges:
         path.extend(graph['edges'][peid]['path'][1:])
+    steps=[dict(edge_id=k,**{'from':graph['edges'][k]['from'],'to':graph['edges'][k]['to']},
+                provenance=deepcopy(graph['edges'][k]['provenance'])) for k in [eid]+edges]
+    transitions=[s for s in steps if s['provenance']['kind']=='automatic_repeat_place']
     return {**result, 'status':'planned', 'path':path, 'route_edge_ids':[eid]+edges,
+            'index_sha256':graph.get('index_sha256'),'route_steps':steps,
+            'recombined':bool(transitions),'junction_transitions':transitions,
             'route_node_ids':[edge['to']]+[graph['edges'][x]['to'] for x in edges],
             'goal_node':goal['node_id'], 'goal_quality':goal['quality'],
             'goal_observation_pose':graph['nodes'][goal['node_id']]['T_MC'],
@@ -274,7 +290,15 @@ class NavigationTask:
         accumulated = 0.
         for i in range(1,len(path)-1):
             accumulated += np.linalg.norm(path[i]-path[i-1]); waypoint=i
-            u, v = path[i]-path[i-1], path[i+1]-path[i]
+            # Repeated observations at a fused junction can have identical
+            # centres. Look through zero-length switches, not through turns.
+            before=next((j for j in range(i-1,-1,-1) if np.linalg.norm(path[i]-path[j])>1e-9),None)
+            after=next((j for j in range(i+1,len(path)) if np.linalg.norm(path[j]-path[i])>1e-9),None)
+            u=path[i]-path[before] if before is not None else np.zeros(3)
+            v=path[after]-path[i] if after is not None else np.zeros(3)
+            if np.linalg.norm(path[i]-position(observation['T_WC_query']))<step*.02:
+                waypoint=i+1
+                continue
             if accumulated >= self.lookahead_steps*step or (min(np.linalg.norm(u),np.linalg.norm(v)) > 1e-9
                     and unit(u)@unit(v) < math.cos(math.radians(25))):
                 break

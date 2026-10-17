@@ -4,6 +4,9 @@ from unittest.mock import Mock, patch
 from types import SimpleNamespace
 import test_viser_viewer as f
 from go1loc.jobs import atomic_json
+from test_navigation_junctions import junction_fixture
+from go1loc.junctions import fuse_junctions
+from go1loc.navigation import NavigationTask
 
 
 class NavigationUITests(unittest.TestCase):
@@ -72,6 +75,58 @@ class NavigationUITests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError,'采集方式'):
             self.app._nav_start(None)
         self.assertIsNone(self.app._nav_worker)
+
+    def test_junction_panel_lists_evidence_and_disables_both_transfers(self):
+        g,obs=junction_fixture();g=fuse_junctions(g,obs)
+        self.app._nav_graph=g
+        self.app._nav_refresh_junctions()
+        self.assertIn('1',self.app.nav_junction_summary.value)
+        self.assertIn('共同三维特征',self.app.nav_junction_summary.value)
+        self.app._nav_task=NavigationTask(g,[dict(node_id='E.png',quality=1.)],up=[0,-1,0])
+        self.app._nav_worker=Mock();self.app._nav_render=Mock()
+        self.app._nav_disable_junction(None)
+        self.assertEqual(self.app._nav_task.closed,set(next(iter(g['junctions'].values()))['edge_ids']))
+        self.assertIn(self.app._nav_task.state,('locating','blocked'))
+
+    def test_target_load_does_not_discard_map_only_index_preparation(self):
+        g,obs=junction_fixture();g=fuse_junctions(g,obs)
+        self.app.controller.model['map_hash']=g['map_hash']
+        profile={'mounts':{'camera6':{}},'map_hash':g['map_hash']}
+        pending=[]
+        def thread(*,target,**kwargs):
+            pending.append(target);return SimpleNamespace(start=lambda:None)
+        with patch.object(self.app,'_nav_profile',return_value=profile), patch(
+                'go1loc.navigation_ui.threading.Thread',side_effect=thread), patch(
+                'go1loc.navigation_ui.prepare_index',return_value=g):
+            self.app._nav_prepare_only(None)
+            self.app._invalidate_target(clear_query=True)
+            pending[0]()
+        self.assertEqual(self.app._nav_graph,g)
+        self.assertIn('1',self.app.nav_junction_summary.value)
+
+    def test_snapshot_cannot_display_final_map_junction(self):
+        g,obs=junction_fixture();self.app._nav_graph=fuse_junctions(g,obs)
+        self.app._nav_refresh_junctions()
+        self.app.controller.mode='build_snapshot'
+        with self.assertRaisesRegex(ValueError,'final_map_required'):
+            self.app._nav_show_junction(None)
+        self.assertFalse(self.app.nav_junction_a.visible)
+
+    def test_pending_index_cannot_publish_after_viewer_closes(self):
+        g,obs=junction_fixture();g=fuse_junctions(g,obs)
+        profile={'mounts':{'camera6':{}},'map_hash':g['map_hash']}
+        pending=[]
+        def thread(*,target,**kwargs):
+            pending.append(target);return SimpleNamespace(start=lambda:None)
+        with patch.object(self.app,'_nav_profile',return_value=profile), patch(
+                'go1loc.navigation_ui.threading.Thread',side_effect=thread), patch(
+                'go1loc.navigation_ui.prepare_index',return_value=g), patch(
+                'go1loc.navigation_ui.save_navigation_index') as save:
+            self.app._nav_prepare_only(None)
+            self.app.close()
+            pending[0]()
+            save.assert_not_called()
+        self.assertIsNone(self.app._nav_graph)
 
 
 if __name__=='__main__':

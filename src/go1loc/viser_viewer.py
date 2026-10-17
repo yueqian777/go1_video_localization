@@ -564,8 +564,7 @@ class ViewerApplication(NavigationControls, PhotoSelectionControls, RouteWorkflo
             self.frame.options = [c['name'] for c in payload['cameras']] or ['(no frames)']
             self.frame.value = self.frame.options[0]
             self._reset_playback(payload)
-            if payload['mode'] == 'final_map_replay':
-                self._nav_map_loaded()
+            self._nav_map_loaded()
             for client in self.server.get_clients().values():
                 self._focus_map(client)
             self._message(f"{payload['mode']} | {len(payload['cameras'])} cameras | "

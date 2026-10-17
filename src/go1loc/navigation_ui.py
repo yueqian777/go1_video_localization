@@ -8,7 +8,7 @@ import numpy as np
 from .jobs import atomic_json, read_json, utc_now
 from .navigation import NavigationTask
 from .navigation_io import (prepare_index, observation_goals, CaptureReplay, LocalCaptureReader,
-                            count_target_matches, reference_pixel_hashes)
+                            count_target_matches, reference_pixel_hashes, save_navigation_index)
 from .navigation_localizer import ResidentLocalizer, LatestFrameWorker
 
 STATES={'locating':'正在定位','planned':'路线已规划','turning':'请按提示转向','following':'沿历史路线前进',
@@ -35,6 +35,7 @@ class NavigationControls:
         gui=self.server.gui
         self._nav_generation=0;self._nav_worker=None;self._nav_task=None;self._nav_source=None
         self._nav_graph=None;self._nav_preparing=False;self._nav_events=[];self._nav_replay_done=False
+        self._nav_index_revision=0
         with self.navigation_panel:
             gui.add_markdown('**选地图 → 选当前画面 → 框选目标 → 开始引导。**\n\n'
                 '你用遥控器行走；网页依据新画面给方向，不发送运动指令。没有尺度时显示地图单位。')
@@ -61,6 +62,14 @@ class NavigationControls:
             self.nav_current=gui.add_image(np.zeros((2,2,3),np.uint8),label='实际用于定位的当前画面',visible=False)
             self.nav_next=gui.add_image(np.zeros((2,2,3),np.uint8),label='下一观察位置的参考画面',visible=False)
             self.nav_detail=gui.add_text('方向与进度','尚无有效定位。',multiline=True,disabled=True)
+            with gui.add_folder('路口融合与路线重组',expand_by_default=False):
+                self.nav_junction_summary=gui.add_text('路口连接状态','加载地图后自动检查重复经过的位置。',multiline=True,disabled=True)
+                self.nav_junction_choice=gui.add_dropdown('查看自动连接',['（暂无连接）'])
+                self._button('查看这个连接的两张历史照片',self._nav_show_junction)
+                self.nav_junction_a=gui.add_image(np.zeros((2,2,3),np.uint8),label='第一次经过',visible=False)
+                self.nav_junction_b=gui.add_image(np.zeros((2,2,3),np.uint8),label='另一次经过',visible=False)
+                self._button('本次任务停用此连接并重新规划',self._nav_disable_junction)
+                gui.add_markdown('连接只在同一冻结地图内推断，不合并未对齐的地图。它不是新走廊或机器人通行保证；原始路段、方向与拐角保持不变。')
             with gui.add_folder('首次使用：地图来源与相机安装',expand_by_default=False):
                 self.nav_traversed=gui.add_checkbox('本地图全程由机器狗自行行走，未搬动、剪辑或倒放',False)
                 self.nav_upright=gui.add_checkbox('所选相机已固定朝前，画面上方朝上',False)
@@ -154,7 +163,11 @@ class NavigationControls:
         self._message('当前原图已设为待框选目标。请打开原图框选；研究模式的独立照片检查保持不变。')
 
     def _nav_map_loaded(self):
+        self._nav_index_revision+=1
         self._nav_invalidate();self._nav_graph=None
+        self._nav_refresh_junctions()
+        if self.controller.mode!='final_map_replay':
+            return
         self.nav_traversed.value=False;self.nav_upright.value=False;self.nav_reverse.value=False
         self.nav_use_up.value=False;self.nav_lookahead.value=3.
         self.nav_calibration.value=''
@@ -200,6 +213,7 @@ class NavigationControls:
 
     def _nav_prepare_only(self,_):
         profile=self._nav_profile();self._nav_invalidate();self._nav_preparing=True
+        self._nav_index_revision+=1
         self._nav_launch(profile,start=False)
 
     def _nav_start(self,_):
@@ -209,10 +223,12 @@ class NavigationControls:
         if not self.target_result:
             raise ValueError('请先上传目标照片，框选并计算；需获得目标支持证据。')
         self._nav_invalidate();self._nav_preparing=True
+        self._nav_index_revision+=1
         self._nav_launch(profile,start=True)
 
     def _nav_launch(self,profile,*,start):
         generation=self._nav_generation;map_dir=self.map_dir;sidecar=self.sidecar/'navigation'
+        index_revision=self._nav_index_revision
         target=self.target_result;mode=self.nav_source_mode.value;camera=self.nav_camera.value
         recording=self._nav_catalog.get(self.nav_recording.value);photo=self.current_photo.value
         from .jobs import _localization_config
@@ -222,12 +238,13 @@ class NavigationControls:
         def setup():
             worker=None
             try:
-                graph=prepare_index(map_dir,sidecar,profile)
+                graph=prepare_index(map_dir,sidecar,profile,publish=False)
                 if start:
                     backend=ResidentLocalizer(map_dir)
                     goals=observation_goals(backend.reconstruction,graph,target)
                     run=sidecar/('task-'+uuid4().hex)
                     atomic_json(run/'goals.json',goals)
+                    atomic_json(run/'navigation_index.json',graph)
                     if mode=='独立录像回放':
                         from .web_capture import capture_path
                         source=CaptureReplay(capture_path(recording),
@@ -243,10 +260,13 @@ class NavigationControls:
                         lookahead_steps=profile.get('lookahead_steps',3.))
                     worker=LatestFrameWorker(lambda:backend,run/'queries')
                 with self._state_lock:
-                    if generation!=self._nav_generation:
+                    if (self._stop.is_set() or index_revision!=self._nav_index_revision or map_dir!=self.map_dir
+                            or (start and generation!=self._nav_generation)):
                         if worker: worker.close()
                         return
+                    save_navigation_index(sidecar,map_dir,graph)
                     self._nav_graph=graph;self._nav_preparing=False
+                    self._nav_refresh_junctions()
                     self.nav_exceptions.value=f"自动连接 {len(graph['edges'])} 条；粗导航点 {len(graph['navigation_nodes'])} 个。\n"+('\n'.join(
                         f"{r['from_frame']} → {r['to_frame']}：{', '.join(r['reasons'])}" for r in graph['exceptions']) or '未检测到断点。')
                     if not start:
@@ -263,7 +283,8 @@ class NavigationControls:
             except Exception as exc:
                 if worker: worker.close()
                 with self._state_lock:
-                    if generation==self._nav_generation:
+                    if (not self._stop.is_set() and index_revision==self._nav_index_revision
+                            and (not start or generation==self._nav_generation)):
                         self._nav_preparing=False;self.nav_status.value='无法开始：'+str(exc)
         threading.Thread(target=setup,daemon=True,name='navigation-setup').start()
 
@@ -285,6 +306,50 @@ class NavigationControls:
         if self._nav_task and (self._nav_task.association or {}).get('status')=='associated':
             self._nav_task.close_edge(self._nav_task.association['edge_id'])
             self._nav_render()
+
+    def _nav_refresh_junctions(self):
+        self.nav_junction_a.visible=False;self.nav_junction_b.visible=False
+        self.controller.clear('navigation_junction')
+        graph=self._nav_graph or {}
+        self._nav_junction_labels={f"{i+1} · {j['frame_names'][0]} ↔ {j['frame_names'][1]}":jid
+            for i,(jid,j) in enumerate(graph.get('junctions',{}).items())}
+        self.nav_junction_choice.options=list(self._nav_junction_labels) or ['（暂无连接）']
+        self.nav_junction_choice.value=self.nav_junction_choice.options[0]
+        candidates=graph.get('junction_candidates',[])
+        rejected=sum(j['status']=='rejected' for j in candidates)
+        records=graph.get('junctions',{})
+        stationary=sum(j.get('repeat_kind')=='stationary_observation' for j in records.values())
+        self.nav_junction_summary.value=(f'自动采用 {len(records)} 处重复位置连接；{rejected} 处近邻候选证据不足。\n'
+            f'其中 {stationary} 处属于重复停留观察，不能当作复杂路口验收。\n'
+            '依据位置、高度、共同三维特征及前后帧；无需逐段人工确认。\n'+
+            '\n'.join(f"{j['frame_names'][0]} ↔ {j['frame_names'][1]}：{j['shared_track_count']} 个共同三维特征"
+                      for j in list(records.values())[:8]))
+
+    def _nav_show_junction(self,_):
+        self._require_final()
+        jid=self._nav_junction_labels.get(self.nav_junction_choice.value)
+        if not jid or not self._nav_graph:
+            raise ValueError('本地图暂未找到证据充分的重复位置连接；不会仅凭距离近连接。')
+        if self._nav_graph['map_hash']!=self.controller.model['map_hash']:
+            raise ValueError('地图已改变，请重新生成本地图的路口连接。')
+        from .viser_viewer import _read_image
+        j=self._nav_graph['junctions'][jid]
+        cameras={c['name']:c for c in self.controller.model['cameras']}
+        for name,handle in zip(j['frame_names'],(self.nav_junction_a,self.nav_junction_b)):
+            handle.image=_read_image(Path(cameras[name]['image_path']));handle.visible=True
+        path=[self._nav_graph['nodes'][n]['T_MC'] for n in j['frame_names']]
+        self._draw_preview('navigation_junction',[np.asarray(T)[:3,3].tolist() for T in path],'',(190,70,210))
+        self._message(f"这两次经过的位置被自动关联；有 {j['shared_track_count']} 个共同三维特征。仅用于路线重组预览，不控制机器狗。")
+
+    def _nav_disable_junction(self,_):
+        jid=self._nav_junction_labels.get(self.nav_junction_choice.value)
+        if not self._nav_task or not jid:
+            raise ValueError('请先开始引导并选择连接；停用只影响本次任务，不改写原地图。')
+        for eid in self._nav_task.graph['junctions'][jid]['edge_ids']:
+            self._nav_task.close_edge(eid)
+        self._nav_worker.reset();self._nav_task.resume()
+        self._nav_render()
+        self._message('本次任务已停用此处的双向连接，等待新画面重新规划；没有替代路线会明确显示无路。')
 
     def _nav_tick(self):
         if not hasattr(self,'_nav_task'):
@@ -343,6 +408,8 @@ class NavigationControls:
             f"下一观察图：{guidance['reference']}\n"
             f"定位计算 {getattr(self,'_nav_latency',0):.2f} 秒；以实际新图推进，不按时间动画推进。"
             if guidance else '当前无有效方向指令。影子引导不会控制机器狗。')
+        if task.plan and task.plan.get('recombined'):
+            self.nav_detail.value+=f"\n已重组历史路段：经过 {len(task.plan['junction_transitions'])} 处自动连接，不是原录像整段重放。"
         if task.last and task.last.get('pose_status')=='localized':
             self.controller.pose('navigation_current',task.last['T_WC_query'],color=(255,130,0))
         if task.plan and task.plan['status']=='planned':

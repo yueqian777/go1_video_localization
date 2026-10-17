@@ -8,7 +8,7 @@ from .route_review import generate_route_candidates, review_route_candidate
 from .video import sha256_file
 
 
-def route_inputs(map_dir):
+def route_inputs(map_dir, *, with_model=False):
     map_dir = Path(map_dir).resolve()
     manifest = verify_map(map_dir)
     import pycolmap
@@ -24,7 +24,7 @@ def route_inputs(map_dir):
         if (not source.is_file() or sha256_file(source) != manifest.get('frames_manifest_sha256')
                 or read_json(source) != frames):
             raise ValueError('frames_manifest_missing_or_hash_mismatch')
-    return manifest, references, frames
+    return (manifest, references, frames, model) if with_model else (manifest, references, frames)
 
 
 def prepare_review(map_dir, max_gap_s=2.):
