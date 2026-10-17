@@ -7,7 +7,7 @@ from dataclasses import replace
 from unittest.mock import patch
 
 from go1loc.local_motion import MotionCapabilities, LocalMotionAdapter, execution_gate
-from go1loc.navigation_localizer import LatestFrameWorker
+from go1loc.navigation_localizer import LatestFrameWorker, ResidentLocalizer
 from go1loc.navigation_io import count_target_matches
 from go1loc.navigation_io import CaptureReplay
 from go1loc.jobs import atomic_json
@@ -15,6 +15,44 @@ import json
 
 
 class ServiceTests(unittest.TestCase):
+    def test_warmup_uses_reference_not_live_observation_and_does_not_seed_location(self):
+        backend=object.__new__(ResidentLocalizer)
+        backend.manifest={'image_dir':'reference-dir'}
+        backend.reference_features={'reference.png':{}}
+        backend.last_references=[];backend.model_loads=0
+        calls=[]
+        def fake_localize(photo,output,config):
+            calls.append(photo);backend.last_references=['reference.png']
+            return {},{},output
+        backend.localize=fake_localize
+        with TemporaryDirectory() as temp:
+            before=time.monotonic()
+            result=backend.warmup(Path(temp))
+            self.assertTrue(result['ready'])
+            self.assertGreaterEqual(result['completed_monotonic'],before)
+            self.assertEqual(backend.last_references,[])
+            backend.warmup(Path(temp)/'again')
+        self.assertEqual(calls,[Path('reference-dir/reference.png')])
+
+    def test_worker_records_clocks_and_rejects_pre_warmup_source_frame(self):
+        class Backend:
+            def localize(self,photo,output,config):return {'pose_status':'localized'}, {}, output
+        with TemporaryDirectory() as temp:
+            ready=time.monotonic();w=LatestFrameWorker(Backend,Path(temp),not_before_monotonic=ready)
+            try:
+                self.assertFalse(w.submit(Path('old.png'),dict(sequence=1,time_mode='live_current',received_monotonic=ready-1)))
+                self.assertTrue(w.submit(Path('fresh.png'),dict(sequence=2,time_mode='live_current',received_monotonic=time.monotonic())))
+                deadline=time.monotonic()+2;value=None
+                while value is None and time.monotonic()<deadline:
+                    time.sleep(.01);value=w.take()
+                clocks=value['timing']
+                self.assertLessEqual(clocks['source_received_monotonic'],clocks['inference_started_monotonic'])
+                self.assertLessEqual(clocks['inference_started_monotonic'],clocks['inference_finished_monotonic'])
+                self.assertLessEqual(clocks['inference_finished_monotonic'],clocks['result_taken_monotonic'])
+                events=[json.loads(s) for s in (Path(temp)/'worker_events.jsonl').read_text('utf-8').splitlines()]
+                self.assertIn('source_predates_warmup',[e.get('reason') for e in events])
+            finally:w.close();w.thread.join(2)
+
     def test_reencoded_mapping_pixels_are_not_independent_replay(self):
         with TemporaryDirectory() as temp:
             root=Path(temp).resolve()

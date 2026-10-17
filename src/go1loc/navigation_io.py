@@ -90,6 +90,7 @@ def observation_goals(model, graph, target):
             continue
         score=.6*min(1.,len(uv)/max(3,len(ids)))+.4*min(1.,spread/.1)
         candidates.append(dict(node_id=im.name,quality=score,support_count=len(uv),
+            target_query_sha256=evidence['binding']['query_sha256'],
             projected_support_span=spread, semantic='visible_surface_observation_not_object_size'))
     if not candidates:
         raise ValueError('target_has_no_sufficient_reference_observation')

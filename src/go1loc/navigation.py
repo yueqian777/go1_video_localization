@@ -81,7 +81,7 @@ def build_navigation_index(manifest, references, frames, declaration):
             traversal+=1
             continue
         eid = f'auto:{i}'
-        edge = dict(edge_id=eid, **{'from': a, 'to': b}, enabled=True,
+        edge = dict(edge_id=eid, physical_segment_id=eid, **{'from': a, 'to': b}, enabled=True,
             path=[Ta[:3,3].tolist(), Tb[:3,3].tolist()], length=length, cost=length,
             units=graph['units'], observation_only=length < step*.08,
             provenance=dict(kind='automatic_recorded_traversal', frame_names=[a,b],
@@ -174,6 +174,28 @@ def _tracking_context(graph, observation, previous, max_gap):
     return graph['edges'][previous['edge_id']]
 
 
+def _segment_directions(graph, eid):
+    """Only an explicitly declared reverse of THIS recorded segment is paired.
+
+    Legacy indexes remain readable. Opposite nearby edges/other traversals are
+    never grouped merely because their geometry is close.
+    """
+    edge = graph['edges'][eid]
+    base = eid[:-8] if eid.endswith(':reverse') else eid
+    pair_id = base if eid.endswith(':reverse') else base+':reverse'
+    pair = graph['edges'].get(pair_id)
+    declaration = graph.get('source_declaration', {})
+    result = [eid]
+    if (pair and declaration.get('reverse_allowed') is True
+            and declaration.get('reversible_plane_confirmed') is True
+            and {edge.get('provenance', {}).get('kind'), pair.get('provenance', {}).get('kind')}
+                == {'automatic_recorded_traversal', 'declared_reversible_traversal'}
+            and pair['from'] == edge['to'] and pair['to'] == edge['from']
+            and np.allclose(pair['path'], list(reversed(edge['path'])))):
+        result.append(pair_id)
+    return sorted(result)
+
+
 def associate_route(graph, observation, previous=None, *, max_tracking_gap_s=3.):
     """Associate a measured pose, not an unconditional nearest-node snap."""
     if (not observation.get('evidence_verified') or observation.get('pose_status') != 'localized'
@@ -195,33 +217,41 @@ def associate_route(graph, observation, previous=None, *, max_tracking_gap_s=3.)
         support = sum(n in refs or len(refs.intersection(
             graph['nodes'][n].get('localization_references',[]))) >= 2 for n in (edge['from'],edge['to']))
         heading = max(float(pose[:3,2] @ _rigid(graph['nodes'][n]['T_MC'])[:3,2]) for n in (edge['from'],edge['to']))
+        upright = max(float(pose[:3,1] @ _rigid(graph['nodes'][n]['T_MC'])[:3,1]) for n in (edge['from'],edge['to']))
+        # The measured view can face back along the same physical corridor.
+        # This requires real PnP support at BOTH ends and compatible camera up;
+        # it is not invented reverse imagery or permission to travel backward.
+        opposite_supported = heading < -.5 and support == 2 and upright >= .5
+        view_compatibility = abs(heading) if opposite_supported else heading
         # Entry remains 2 sampling intervals. A previously acquired track has
         # a half-interval exit deadband, only with BOTH endpoint supports,
         # compatible heading and a newer same-source pose moving <= one interval.
         # This is a camera-route association, never a traversability certificate.
-        tracking=bool(old and support==2 and heading>=.5 and d<=2.5*step
+        tracking=bool(old and support==2 and view_compatibility>=.5 and d<=2.5*step
                       and np.linalg.norm(q-np.asarray(previous['projection']))<=step
                       and (eid==previous['edge_id'] or edge['from']==old['to']
                            or _same_dwell_chain(graph,old,edge)))
         limit=(2.5 if tracking else 2.)*step
-        score = d/step + .2*(1-heading) + .15*(2-support)
+        score = d/step + .2*(1-view_compatibility) + .15*(2-support)
         if old:
             if eid == previous['edge_id'] or edge['from'] == old['to']:
                 score -= .15
         candidate=dict(edge_id=eid, fraction=t, projection=q.tolist(), distance=d,
                        score=score, reference_support=support, heading_agreement=heading,
+                       visual_heading_agreement=heading, opposite_view_supported=opposite_supported,
                        distance_limit=limit, entry_limit=2*step,
                        association_mode='bounded_tracking' if d>2*step and tracking else 'core_entry')
         reasons=[]
         if d>limit: reasons.append('distance')
         if not support: reasons.append('reference_support')
-        if heading<-.5: reasons.append('heading')
+        if heading<-.5 and not opposite_supported: reasons.append('heading')
         if reasons:
             rejected.append({**candidate,'rejection_reasons':reasons});continue
         candidates.append(candidate)
-    candidates.sort(key=lambda x:x['score'])
+    candidates.sort(key=lambda x:(x['score'], x['edge_id']))
     if not candidates:
-        return {'status':'off_route', 'candidates':[],
+        heading_only = any(c['rejection_reasons'] == ['heading'] for c in rejected)
+        return {'status':'opposite_view_evidence_insufficient' if heading_only else 'off_route', 'candidates':[],
                 'rejected_candidates':sorted(rejected,key=lambda c:c['distance'])[:3]}
     best = candidates[0]
     for other in candidates[1:]:
@@ -245,6 +275,43 @@ def associate_route(graph, observation, previous=None, *, max_tracking_gap_s=3.)
 
 
 def plan_guidance(graph, association, goals, closed=()):
+    """Associate a physical segment first; choose its legal direction by goal.
+
+    Never add reverse edges here. Both directions retain the original measured
+    camera poses and explicit reverse_visual_support=False where applicable.
+    """
+    if association.get('status') != 'associated':
+        return _plan_from_direction(graph, association, goals, closed)
+    closed = set(closed)
+    for eid in list(closed):
+        closed.update(_segment_directions(graph, eid))
+    plans = []
+    for eid in _segment_directions(graph, association['edge_id']):
+        if not graph['edges'][eid]['enabled']:
+            continue
+        a = deepcopy(association)
+        if eid != a['edge_id']:
+            a['fraction'] = 1.-a['fraction']
+        a['edge_id'] = eid
+        p = _plan_from_direction(graph, a, goals, closed)
+        p['start_association'] = a
+        plans.append(p)
+    good = [p for p in plans if p['status'] == 'planned']
+    if good:
+        return min(good, key=lambda p:(p['planning_cost'], p['route_edge_ids']))
+    result = plans[0] if plans else _plan_from_direction(graph, association, goals, closed)
+    edge = graph['edges'][association['edge_id']]
+    delta = np.subtract(edge['path'][-1], edge['path'][0])
+    if (result.get('reason') != 'current_segment_closed'
+            and len(_segment_directions(graph, association['edge_id'])) == 1
+            and any(g.get('quality',0) >= .5 and g['node_id'] in graph['nodes']
+                    and np.subtract(position(graph['nodes'][g['node_id']]['T_MC']), association['projection'])@delta < 0
+                    for g in goals)):
+        result['reason'] = 'reverse_travel_not_enabled'
+    return result
+
+
+def _plan_from_direction(graph, association, goals, closed=()):
     result = dict(status='no_path', path=[], route_edge_ids=[], execution_permitted=False,
                   units=graph['units'], route_kind='camera_route', goal_semantics='target_observation_pose')
     if association.get('status') != 'associated':
@@ -271,6 +338,9 @@ def plan_guidance(graph, association, goals, closed=()):
                 provenance=deepcopy(graph['edges'][k]['provenance'])) for k in [eid]+edges]
     transitions=[s for s in steps if s['provenance']['kind']=='automatic_repeat_place']
     return {**result, 'status':'planned', 'path':path, 'route_edge_ids':[eid]+edges,
+            'planning_cost':float(np.linalg.norm(np.subtract(edge['path'][-1], association['projection'])))
+                +distance[goal['node_id']]+3*graph['typical_step']*(1-goal['quality']),
+            'reverse_visual_support':all(s['provenance'].get('reverse_visual_support', True) for s in steps),
             'index_sha256':graph.get('index_sha256'),'route_steps':steps,
             'recombined':bool(transitions),'junction_transitions':transitions,
             'route_node_ids':[edge['to']]+[graph['edges'][x]['to'] for x in edges],
@@ -291,11 +361,13 @@ class NavigationTask:
         self.last = None; self.association = None; self.closed = set()
         self.best_remaining = math.inf; self.progress_time = None
         self.arrival_sequence = None; self.reason = None
+        self.arrival_goal = None
         self.stable_association=None; self.recovery_candidate=None
         self.progress_notice=None
 
     def clear_tracking(self):
         self.association=None; self.stable_association=None; self.recovery_candidate=None
+        self.arrival_sequence=None; self.arrival_goal=None
 
     def pause(self):
         self.state = 'paused'; self.guidance = None
@@ -322,7 +394,8 @@ class NavigationTask:
             return False
         if self.reason not in (None, 'off_route', 'ambiguous_branch',
                 'branch_change_needs_second_observation', 'no_reachable_good_observation',
-                'no_observed_progress', 'current_segment_closed', 'heading_undefined'):
+                'no_observed_progress', 'current_segment_closed', 'heading_undefined',
+                'reverse_travel_not_enabled', 'opposite_view_evidence_insufficient'):
             return False
         o = self.last
         if (o.get('pose_status') != 'localized' or o.get('evidence_verified') is not True
@@ -339,7 +412,26 @@ class NavigationTask:
     def close_edge(self, edge_id):
         if edge_id not in self.graph['edges']:
             raise ValueError('unknown_edge')
-        self.closed.add(edge_id); self.guidance = None; self.plan = None; self.state = 'blocked'
+        self.closed.update(_segment_directions(self.graph, edge_id))
+        self.guidance = None; self.plan = None; self.state = 'blocked'
+        self.arrival_sequence=None; self.arrival_goal=None
+
+    def _observation_region(self, observation):
+        """Arrival is a measured local predicate, not a successful graph search."""
+        if (observation.get('evidence_verified') is not True or observation.get('pose_status') != 'localized'
+                or any(observation.get(k) != self.graph[k] for k in ('map_hash','component_id'))
+                or observation.get('target_matches',0) < 3):
+            return None
+        T = _rigid(observation['T_WC_query'])
+        eligible=[]
+        for goal in self.goals:
+            if goal.get('quality',0)<.5 or goal['node_id'] not in self.graph['nodes']:
+                continue
+            G = _rigid(self.graph['nodes'][goal['node_id']]['T_MC'])
+            d=float(np.linalg.norm(T[:3,3]-G[:3,3]))
+            if d<=self.graph['typical_step'] and float(T[:3,2]@G[:3,2])>=.5:
+                eligible.append((d,goal['node_id'],goal))
+        return min(eligible, key=lambda x:(x[0],x[1]))[2] if eligible else None
 
     def observe(self, observation, *, now):
         if self.state in ('paused','cancelled','failed','target_confirmed'):
@@ -356,8 +448,29 @@ class NavigationTask:
         if self.last and observation['query_sha256'] == self.last['query_sha256']:
             self.clear_tracking()
             self.state='relocalizing'; self.guidance=None; self.plan=None; self.reason='unchanged_pixels_static_or_frozen'; return
+        if observation.get('query_sha256') in {g.get('target_query_sha256') for g in self.goals}:
+            self.clear_tracking()
+            self.state='relocalizing';self.guidance=None;self.plan=None;self.reason='target_photo_reused';return
+        clock='received_monotonic' if observation['time_mode']=='live_current' else 'image_time_s'
+        if self.last and observation[clock] <= self.last[clock]:
+            self.clear_tracking()
+            self.state='relocalizing';self.guidance=None;self.plan=None;self.reason='nonmonotonic_observation';return
         self.last = deepcopy(observation)
         self.progress_notice=None
+        region = self._observation_region(observation)
+        if region:
+            node=region['node_id']
+            if self.arrival_goal != node:
+                self.arrival_sequence=observation['sequence'];self.arrival_goal=node
+            self.state='observation_region_reached';self.reason=None;self.guidance=None
+            self.association=None
+            self.plan=dict(status='observation_region',goal_node=node,
+                goal_observation_pose=self.graph['nodes'][node]['T_MC'],
+                path=[position(observation['T_WC_query']).tolist()], route_edge_ids=[], route_node_ids=[],
+                length=0., units=self.graph['units'], execution_permitted=False,
+                goal_semantics='target_observation_pose', route_kind='camera_route')
+            return
+        self.arrival_sequence=None;self.arrival_goal=None
         a = associate_route(self.graph, observation, self.association,max_tracking_gap_s=self.max_age_s)
         self.association = a
         if a['status'] != 'associated':
@@ -378,6 +491,8 @@ class NavigationTask:
         self.plan = plan_guidance(self.graph, a, self.goals, self.closed)
         if self.plan['status'] != 'planned':
             self.state='blocked'; self.guidance=None; self.reason=self.plan.get('reason'); return
+        self.association=self.plan.get('start_association',a)
+        self.stable_association=self.association
         self.reason=None
         remaining = self.plan['length']; step = self.graph['typical_step']
         image_time = float(observation['image_time_s'])
@@ -387,16 +502,6 @@ class NavigationTask:
             # Shadow mode sends no movement. No measured progress is NOT
             # evidence of an obstacle: only explicit close_edge may close it.
             self.progress_notice='stationary_or_no_observed_progress'
-        goal_distance = float(np.linalg.norm(position(observation['T_WC_query'])-position(self.plan['goal_observation_pose'])))
-        # A region spans one measured reference sampling interval, not a
-        # fabricated metric radius or an exact historic camera pixel pose.
-        goal_heading=float(_rigid(observation['T_WC_query'])[:3,2] @ _rigid(self.plan['goal_observation_pose'])[:3,2])
-        if remaining <= step and goal_distance <= step and goal_heading >= .5:
-            self.state='observation_region_reached'; self.guidance=None
-            if self.arrival_sequence is None:
-                self.arrival_sequence=observation['sequence']
-            return
-        self.arrival_sequence=None
         path = np.asarray(self.plan['path']); waypoint = 1
         accumulated = 0.
         for i in range(1,len(path)-1):
@@ -421,11 +526,13 @@ class NavigationTask:
             self.state='relocalizing'; self.guidance=None; self.reason='heading_undefined'; return
         forward, delta = unit(forward),unit(delta)
         angle=math.atan2(float(self.up@np.cross(forward,delta)),float(forward@delta))
-        direction='左转' if angle > .25 else '右转' if angle < -.25 else '向前'
+        direction=('请先转身' if abs(angle)>math.radians(120) else
+                   '左转' if angle > .25 else '右转' if angle < -.25 else '向前')
         self.state='turning' if abs(angle) > .4 else 'following'; self.reason=None
         self.guidance=dict(direction=direction, yaw_error_degrees=math.degrees(angle),
             waypoint=path[waypoint].tolist(), reference=self.plan['route_node_ids'][waypoint-1],
             remaining=remaining, units=self.graph['units'], image_sequence=observation['sequence'],
+            reverse_visual_support=self.plan.get('reverse_visual_support',True),
             execution_permitted=False, mode='shadow_guidance')
 
     def confirm(self, *, now):

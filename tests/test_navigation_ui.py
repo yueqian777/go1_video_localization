@@ -12,6 +12,45 @@ from go1loc.navigation import NavigationTask
 class NavigationUITests(unittest.TestCase):
     setUp=f.ApplicationTests.setUp
 
+    def test_start_prewarms_before_source_and_reuses_one_retired_backend(self):
+        from test_navigation import setup_graph
+        g=setup_graph();order=[]
+        profile={'mounts':{'camera6':{}},'map_hash':g['map_hash']}
+        backend=Mock();backend.map_dir=self.app.map_dir.resolve()
+        backend.warmup.side_effect=lambda *args: order.append('warm') or {'completed_monotonic':10.,'ready':True}
+        worker=Mock();worker.thread.join.side_effect=lambda:order.append('retired')
+        def reader(*args):order.append('reader');return Mock()
+        def thread(*,target,**kwargs):return SimpleNamespace(start=target)
+        self.app.target_result={'status':'supported'};self.app.nav_upright.value=True
+        with patch.object(self.app,'_nav_profile',return_value=profile), patch(
+                'go1loc.navigation_ui.threading.Thread',side_effect=thread), patch(
+                'go1loc.navigation_ui.prepare_index',return_value=g), patch(
+                'go1loc.navigation_ui.ResidentLocalizer',return_value=backend) as factory, patch(
+                'go1loc.navigation_ui.observation_goals',return_value=[]), patch(
+                'go1loc.navigation_ui.LatestFrameWorker',return_value=worker) as workers, patch.object(
+                self.app,'_nav_live_reader',side_effect=reader):
+            self.app._nav_start(None)
+            self.assertEqual(order,['warm','reader'])
+            self.app._nav_source.next.assert_not_called()
+            self.app._nav_start(None)
+        self.assertEqual(order,['warm','reader','retired','warm','reader'])
+        self.assertEqual(factory.call_count,1)
+        self.assertEqual(workers.call_args.kwargs['not_before_monotonic'],10.)
+
+    def test_warmup_failure_never_reads_current_frames_or_publishes_worker(self):
+        from test_navigation import setup_graph
+        g=setup_graph();profile={'mounts':{'camera6':{}},'map_hash':g['map_hash']}
+        backend=Mock();backend.map_dir=self.app.map_dir.resolve();backend.warmup.side_effect=ValueError('warmup failed')
+        def thread(*,target,**kwargs):return SimpleNamespace(start=target)
+        with patch('go1loc.navigation_ui.threading.Thread',side_effect=thread), patch(
+                'go1loc.navigation_ui.prepare_index',return_value=g), patch(
+                'go1loc.navigation_ui.ResidentLocalizer',return_value=backend), patch.object(
+                self.app,'_nav_live_reader') as reader:
+            self.app._nav_launch(profile,start=True)
+        reader.assert_not_called()
+        self.assertIsNone(self.app._nav_worker)
+        self.assertIn('warmup failed',self.app.nav_status.value)
+
     def test_off_route_pose_visible_but_old_route_retired_and_age_checked(self):
         from test_navigation import setup_graph, observation
         g=setup_graph();task=NavigationTask(g,[dict(node_id='m.png',quality=1.)],up=[0,0,1])
@@ -58,6 +97,10 @@ class NavigationUITests(unittest.TestCase):
         self.assertEqual(event['observation_metadata']['sequence'],1)
         self.assertEqual(event['observation_metadata']['received_monotonic'],1.)
         self.assertEqual(event['evaluated_monotonic'],6.)
+        self.assertEqual(event['adoption'],'rejected')
+        self.assertEqual(event['adoption_reason'],'stale_result')
+        self.assertEqual(event['timing']['ui_applied_monotonic'],6.)
+        self.assertTrue((self.app._nav_run/'guidance_events.jsonl').is_file())
 
     def test_model_error_is_not_replaced_by_bad_photo_advice(self):
         from test_navigation import setup_graph
@@ -68,6 +111,29 @@ class NavigationUITests(unittest.TestCase):
         self.app._nav_tick()
         self.assertIn('model initialization failed',self.app.nav_status.value)
         self.assertNotIn('更多环境细节',self.app.nav_status.value)
+        self.assertNotIn('navigation_current',self.app.controller.groups)
+
+    def test_stale_failed_pose_keeps_both_causes_and_does_not_suggest_dead_camera(self):
+        from test_navigation import setup_graph, observation
+        g=setup_graph();self.app._nav_task=NavigationTask(g,[],up=[1,0,0])
+        self.app._nav_worker=Mock();self.app._nav_source=None
+        self.app._nav_run=self.app.sidecar/'failed-pose';self.app._nav_camera_at_start='camera6'
+        self.app.target_result={'supporting_point3D_ids':[]}
+        o=observation(g);o.update(time_mode='live_current',image_path='local-test.png',
+            pose_status='insufficient_evidence',T_WC_query=None,failure_reason='insufficient_pnp_quality',
+            quality={'inlier_ratio':.10,'num_inliers':90,'acceptance_thresholds':{'min_inlier_ratio':.25}})
+        self.app._nav_worker.take.return_value=dict(error=None,observation=o,latency_s=3.2,directory='query')
+        with patch('go1loc.navigation_ui.time.monotonic',return_value=5.), patch(
+                'go1loc.viser_viewer._read_image',return_value=f.np.zeros((2,2,3),dtype=f.np.uint8)):
+            self.app._nav_tick()
+        event=self.app._nav_events[-1]
+        self.assertEqual(event['localization_diagnostic']['failure_reason'],'insufficient_pnp_quality')
+        self.assertEqual(event['localization_diagnostic']['pose_status'],'insufficient_evidence')
+        self.assertEqual(event['localization_diagnostic']['received_to_evaluation_s'],4.)
+        self.assertIn('位姿质量不足',self.app.nav_status.value)
+        self.assertIn('超时',self.app.nav_status.value)
+        self.assertIn('不是已证实的相机断流',self.app.nav_status.value)
+        self.assertIsNone(self.app._nav_task.guidance)
         self.assertNotIn('navigation_current',self.app.controller.groups)
 
     def test_default_ui_has_normal_controls_not_json_entry(self):

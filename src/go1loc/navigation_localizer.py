@@ -4,6 +4,7 @@ Uses the pinned hloc preprocessing, SuperPoint, LightGlue and PyCOLMAP evidence
 export. Reference features and models stay resident; research CLI is unchanged.
 """
 from copy import deepcopy
+from dataclasses import asdict
 import json
 from pathlib import Path
 import threading
@@ -47,6 +48,26 @@ class ResidentLocalizer:
         if any((p.stat().st_size,p.stat().st_mtime_ns) != s for p,s in self.stamps.items()):
             raise ValueError('frozen_map_changed_restart_required')
         return self.manifest
+
+    def warmup(self, output, config=None):
+        """Load/run the SAME models using a reference, never a current frame.
+
+        The warmup result is not an observation and cannot seed tracking.
+        Subsequent tasks reuse this resident instance and its warmed models.
+        """
+        key=json.dumps(asdict(config) if config is not None else {},sort_keys=True,default=str)
+        started=time.monotonic()
+        cached=key in getattr(self,'_warmed_configs',set())
+        if not cached:
+            photo=Path(self.manifest['image_dir'])/next(iter(self.reference_features))
+            try:
+                self.localize(photo,Path(output),config)
+            finally:
+                self.last_references=[]
+            self._warmed_configs=getattr(self,'_warmed_configs',set())|{key}
+        return dict(ready=True,cached=cached,started_monotonic=started,
+                    completed_monotonic=time.monotonic(),model_loads=self.model_loads,
+                    input_kind='frozen_reference_warmup_not_current_observation')
 
     def _model(self, namespace, conf):
         from hloc.utils.base_model import dynamic_load
@@ -152,33 +173,55 @@ def verified_localization(directory, map_hash):
 
 class LatestFrameWorker:
     """One in-flight inference and one replaceable pending frame; generation fence."""
-    def __init__(self, factory, output):
+    def __init__(self, factory, output, *, not_before_monotonic=0.):
         self.factory=factory; self.output=Path(output); self.backend=None
+        self.output.mkdir(parents=True,exist_ok=True)
+        self.not_before_monotonic=not_before_monotonic
         self.condition=threading.Condition(); self.pending=None; self.completed=None
         self.generation=0; self.closed=False; self.dropped=0; self.busy=False
         self.thread=threading.Thread(target=self._run,daemon=True,name='navigation-localizer')
         self.thread.start()
 
+    def _record(self, kind, metadata=None, **fields):
+        row=dict(event=kind,at_monotonic=time.monotonic(),generation=self.generation,
+                 metadata=metadata or {},**fields)
+        with (self.output/'worker_events.jsonl').open('a',encoding='utf-8') as f:
+            f.write(json.dumps(row,ensure_ascii=False,allow_nan=False)+'\n')
+
     def reset(self):
         with self.condition:
+            if self.pending:self._record('rejected',self.pending[2],reason='generation_reset_pending')
+            if self.completed:self._record('rejected',self.completed.get('metadata'),reason='generation_reset_completed')
             self.generation+=1; self.pending=None; self.completed=None
 
     def submit(self, photo, metadata, config=None):
         with self.condition:
             if self.closed:
-                return
+                return False
+            if (metadata.get('time_mode')=='live_current'
+                    and metadata.get('received_monotonic',0)<self.not_before_monotonic):
+                self._record('rejected',metadata,reason='source_predates_warmup')
+                return False
             if self.pending:
                 self.dropped+=1
-            self.pending=(self.generation,Path(photo),deepcopy(metadata),config)
+                self._record('replaced',self.pending[2],reason='newer_pending_frame')
+            submitted=time.monotonic()
+            self.pending=(self.generation,Path(photo),deepcopy(metadata),config,submitted)
+            self._record('submitted',metadata,submitted_monotonic=submitted)
             self.condition.notify()
+            return True
 
     def take(self):
         with self.condition:
             result,self.completed=self.completed,None
+            if result:result['timing']['result_taken_monotonic']=time.monotonic()
             return result
 
     def close(self):
         with self.condition:
+            if self.pending:self._record('rejected',self.pending[2],reason='worker_closed_pending')
+            if self.completed:self._record('rejected',self.completed.get('metadata'),reason='worker_closed_completed')
+            self.completed=None
             self.closed=True; self.pending=None; self.generation+=1; self.condition.notify()
 
     def _run(self):
@@ -187,17 +230,28 @@ class LatestFrameWorker:
                 self.condition.wait_for(lambda:self.closed or self.pending is not None)
                 if self.closed:
                     return
-                generation,photo,metadata,config=self.pending; self.pending=None; self.busy=True
-            started=time.monotonic()
+                generation,photo,metadata,config,submitted=self.pending; self.pending=None; self.busy=True
+            started=None
             try:
                 if self.backend is None:
                     self.backend=self.factory()
+                started=time.monotonic()
                 result,evidence,directory=self.backend.localize(photo,self.output/uuid4().hex,config)
                 value={'observation':{**result,**metadata,'image_path':str(photo)},'directory':str(directory),
                        'latency_s':time.monotonic()-started,'error':None}
             except Exception as exc:
-                value={'error':str(exc),'metadata':metadata,'latency_s':time.monotonic()-started}
+                value={'error':str(exc),'metadata':metadata,'latency_s':time.monotonic()-(started or submitted)}
+            finished=time.monotonic()
+            value['metadata']=metadata
+            value['timing']=dict(source_received_monotonic=metadata.get('received_monotonic'),
+                submitted_monotonic=submitted,inference_started_monotonic=started,
+                inference_finished_monotonic=finished,
+                clock_semantics='PC_monotonic_not_sensor_exposure')
             with self.condition:
                 self.busy=False
                 if generation==self.generation and not self.closed:
+                    if self.completed:self._record('replaced',self.completed.get('metadata'),reason='newer_completed_result')
                     self.completed=value
+                    self._record('completed',metadata,timing=value['timing'],error=value['error'])
+                else:
+                    self._record('rejected',metadata,reason='late_generation_result',timing=value['timing'])

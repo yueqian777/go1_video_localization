@@ -45,7 +45,7 @@ class LiveFrameReader:
         if key == self.key:
             return None
         path = self.output / ('current-' + uuid4().hex + '.png')
-        Image.fromarray(frame.rgb()).save(path)
+        Image.fromarray(frame.rgb()).save(path,compress_level=1)
         current = self.check_available()
         if current.header['session_id'] != h['session_id'] or current.header['camera_id'] != h['camera_id']:
             raise ValueError('相机连接已改变，请重新开始定位。')

@@ -1,5 +1,6 @@
 """Default Viser shadow-guidance workflow; strict research tools remain separate."""
 from pathlib import Path
+import json
 import threading
 import time
 from uuid import uuid4
@@ -28,6 +29,10 @@ REASONS={'ambiguous_branch':'附近有多段相似路线，请换一个视角，
 REASONS['branch_change_needs_second_observation']='定位发生较大路段跳变，正在等待第二张实际画面确认；请保持观察，不按旧方向行走。'
 REASONS['replay_ended_without_fabricated_arrival']='这段独立录像已经读完，但尚未取得到达证据。请采集沿已知路线走向目标的新录像。'
 REASONS['reference_evidence_missing']='缺少可靠参考图对应，等待更清晰的新视角。'
+REASONS['reverse_travel_not_enabled']='当前位置已定位，但目标在历史行进方向后方，当前图未允许这段反向通行。请核对一次性反向设置；不会自动新增反向边。'
+REASONS['opposite_view_evidence_insufficient']='相机朝向与历史视角相反，缺少双端参考或正立证据，暂不能可靠关联；不是单纯距离偏离。'
+REASONS['target_photo_reused']='目标原照片不能充当当前观测，请使用新采集画面。'
+REASONS['nonmonotonic_observation']='观测源时间未递增，未采用该结果。'
 
 
 class NavigationControls:
@@ -37,6 +42,9 @@ class NavigationControls:
         self._nav_graph=None;self._nav_preparing=False;self._nav_events=[];self._nav_replay_done=False
         self._nav_index_revision=0
         self._nav_error=None
+        self._nav_diagnostic=None;self._nav_source_problem=False
+        self._nav_backend=None;self._nav_setup_lock=threading.Lock();self._nav_retiring_workers=[]
+        self._nav_render_key=None
         with self.navigation_panel:
             gui.add_markdown('**选地图 → 选当前画面 → 框选目标 → 开始引导。**\n\n'
                 '你用遥控器行走；网页依据新画面给方向，不发送运动指令。没有尺度时显示地图单位。')
@@ -102,7 +110,11 @@ class NavigationControls:
         self._nav_generation+=1;self._nav_preparing=False
         if self._nav_worker:
             self._nav_worker.close()
+            self._nav_retiring_workers.append(self._nav_worker)
+        self._nav_flush()
         self._nav_worker=None;self._nav_task=None;self._nav_source=None;self._nav_replay_done=False
+        self._nav_diagnostic=None;self._nav_source_problem=False;self._nav_error=None
+        self._nav_render_key=None
         self.nav_status.value='等待开始；旧任务已失效。'
         self.nav_next.visible=False;self.nav_current.visible=False
         self.nav_detail.value='输入已改变，旧路线和方向提示已撤销。'
@@ -245,9 +257,31 @@ class NavigationControls:
             try:
                 graph=prepare_index(map_dir,sidecar,profile,publish=False)
                 if start:
-                    backend=ResidentLocalizer(map_dir)
-                    goals=observation_goals(backend.reconstruction,graph,target)
                     run=sidecar/('task-'+uuid4().hex)
+                    # A single resident GPU backend per viewer. Retire old
+                    # inference before reuse/replacement, including rapid restarts.
+                    with self._nav_setup_lock:
+                        for old in self._nav_retiring_workers:
+                            old.thread.join()
+                            old.backend=None;old.factory=None
+                        self._nav_retiring_workers=[]
+                        if generation!=self._nav_generation or self._stop.is_set():return
+                        backend=self._nav_backend
+                        if backend is None or backend.map_dir!=Path(map_dir).resolve():
+                            self._nav_backend=None
+                            backend=None
+                            backend=ResidentLocalizer(map_dir)
+                            self._nav_backend=backend
+                        backend.verified_manifest(map_dir)
+                        self.nav_status.value='正在预热同一套定位模型；完成后才读取新的当前画面…'
+                        warmup=backend.warmup(run/'warmup',config)
+                        backend.last_references=[]
+                    atomic_json(run/'warmup.json',warmup)
+                    atomic_json(run/'parameters.json',dict(profile=profile,max_age_s=3.,
+                        no_progress_s=20.,entry_step_multiple=2.,tracking_step_multiple=2.5,
+                        typical_step=graph['typical_step'],map_hash=graph['map_hash'],
+                        localization_config=str(config),execution_permitted=False))
+                    goals=observation_goals(backend.reconstruction,graph,target)
                     atomic_json(run/'goals.json',goals)
                     atomic_json(run/'navigation_index.json',graph)
                     if mode=='独立录像回放':
@@ -263,7 +297,8 @@ class NavigationControls:
                             raise ValueError('请上传当前位置照片；拍摄时间未知时仅作为离线观测。')
                     task=NavigationTask(graph,goals,up=profile.get('up_override') or graph['up_estimate'],
                         lookahead_steps=profile.get('lookahead_steps',3.))
-                    worker=LatestFrameWorker(lambda:backend,run/'queries')
+                    worker=LatestFrameWorker(lambda:backend,run/'queries',
+                        not_before_monotonic=warmup['completed_monotonic'])
                 with self._state_lock:
                     if (self._stop.is_set() or index_revision!=self._nav_index_revision or map_dir!=self.map_dir
                             or (start and generation!=self._nav_generation)):
@@ -279,7 +314,7 @@ class NavigationControls:
                         self.nav_status.value='导航索引已准备好，不需要逐段点确认。';return
                     self._nav_worker=worker;self._nav_task=task;self._nav_source=source
                     self._nav_config=config;self._nav_camera_at_start=camera;self._nav_run=run;self._nav_events=[]
-                    self.nav_status.value='等待当前画面定位。'
+                    self.nav_status.value='预热完成，等待预热之后的新画面定位。'
                     if source is None:
                         from .video import sha256_file
                         worker.submit(Path(photo),dict(sequence=1,session_id=uuid4().hex,camera_id=camera,
@@ -299,6 +334,7 @@ class NavigationControls:
             self._nav_task.pause()
             self._nav_worker.reset()
             self._nav_render()
+            self._nav_flush()
 
     def _nav_resume(self):
         if self._nav_task:
@@ -307,6 +343,20 @@ class NavigationControls:
     def _nav_cancel(self):
         if self._nav_task:
             self._nav_task.cancel();self._nav_worker.reset();self._nav_source=None;self._nav_render()
+            self._nav_flush()
+
+    def _nav_append(self,name,row):
+        run=getattr(self,'_nav_run',None)
+        if run is not None:
+            run.mkdir(parents=True,exist_ok=True)
+            with (run/name).open('a',encoding='utf-8') as f:
+                f.write(json.dumps(row,ensure_ascii=False,allow_nan=False)+'\n')
+
+    def _nav_flush(self):
+        # Compatibility snapshot on pause/end; do not rewrite a growing 24MB
+        # JSON array in every frame's UI critical path. JSONL is authoritative live.
+        if getattr(self,'_nav_run',None) is not None and self._nav_events:
+            atomic_json(self._nav_run/'guidance_log.json',self._nav_events)
 
     def _nav_close_current(self,_):
         if self._nav_task and (self._nav_task.association or {}).get('status')=='associated':
@@ -375,21 +425,31 @@ class NavigationControls:
                         task.last['camera_id']!='camera'+str(frame.header['camera_id'])):
                     raise ValueError('采集会话改变，请重新开始引导。')
             except ValueError:
+                self._nav_source_problem=True
                 worker.reset();task.state='relocalizing';task.guidance=None;task.plan=None
                 task.clear_tracking()
                 task.reason='frame_stale_or_disconnected'
                 self.nav_current.visible=False
                 self._nav_render()
                 return
+            self._nav_source_problem=False
         completed=worker.take()
+        event=None
         if completed:
             if completed['error']:
+                self._nav_diagnostic=None
                 task.state='relocalizing';task.guidance=None;task.plan=None;task.reason='localization_required'
                 task.clear_tracking()
                 self._nav_error=completed['error']
             else:
                 self._nav_error=None
                 observation=completed['observation']
+                quality=observation.get('quality') or {}
+                self._nav_diagnostic=dict(sequence=observation['sequence'],
+                    pose_status=observation.get('pose_status'),failure_reason=observation.get('failure_reason'),
+                    received_to_evaluation_s=time.monotonic()-observation['received_monotonic'],
+                    quality={k:quality.get(k) for k in ('num_inliers','inlier_ratio',
+                        'mean_inlier_reprojection_px','acceptance_thresholds','query_intrinsics','query_camera')})
                 if observation['camera_id']!=self._nav_camera_at_start:
                     self._nav_pause();self.nav_status.value='输入相机与所选安装配置不同，请选择对应相机重新开始。';return
                 observation['target_matches']=count_target_matches(observation,self.target_result)
@@ -400,16 +460,34 @@ class NavigationControls:
             # Retain source clocks even for stale/rejected results. A task's last
             # accepted sequence alone cannot reconstruct inference freshness.
             metadata=completed.get('observation') or completed.get('metadata') or {}
-            self._nav_events.append({**task.snapshot(),'at':utc_now(),'latency_s':completed['latency_s'],
+            event={**task.snapshot(),'at':utc_now(),'latency_s':completed['latency_s'],
                 'observation_metadata':{k:metadata.get(k) for k in ('sequence','session_id','camera_id',
                     'time_mode','image_time_s','received_monotonic','runtime_at','time_source','sensor_capture_time')},
                 'evaluated_monotonic':time.monotonic(),
-                'query_directory':completed.get('directory'),'error':completed['error']})
-            atomic_json(self._nav_run/'guidance_log.json',self._nav_events[-10000:])
+                'query_directory':completed.get('directory'),'error':completed['error'],
+                'localization_diagnostic':self._nav_diagnostic,
+                'timing':dict(completed.get('timing') or {})}
         task.tick(time.monotonic())
+        self._nav_render()
+        if event:
+            adopted=time.monotonic()
+            valid=task.current_pose_available(adopted)
+            metadata=completed.get('observation') or completed.get('metadata') or {}
+            accepted=bool(valid and task.last and task.last['sequence']==metadata.get('sequence'))
+            event.update(task.snapshot())
+            event.update(adoption='accepted' if accepted else 'rejected',
+                adoption_reason=('guidance' if task.guidance else task.reason or task.state) if accepted
+                    else completed.get('error') or task.reason or task.state)
+            event['timing'].update(ui_applied_monotonic=adopted,
+                source_received_monotonic=metadata.get('received_monotonic'),
+                ui_clock_scope='Viser_server_scene_state_not_browser_paint')
+            self._nav_events.append(event)
+            self._nav_append('guidance_events.jsonl',event)
         if self._nav_source and task.state not in ('paused','cancelled','target_confirmed'):
             live=isinstance(self._nav_source,LocalCaptureReader) or getattr(self._nav_source,'is_live',False)
-            if live or (not worker.busy and worker.pending is None):
+            # Fetch only when the single worker can consume it. A queued PNG
+            # otherwise spends an extra inference interval aging before use.
+            if not worker.busy and worker.pending is None:
                 try:
                     item=self._nav_source.next()
                     if item:
@@ -418,6 +496,7 @@ class NavigationControls:
                         self._nav_replay_done=True;self._nav_source=None
                         task.pause();task.reason='replay_ended_without_fabricated_arrival'
                 except Exception as exc:
+                    self._nav_source_problem=True
                     task.state='relocalizing';task.guidance=None;task.reason='frame_stale_or_disconnected'
                     task.plan=None;task.clear_tracking()
                     self.nav_status.value='采集不可用：'+str(exc)
@@ -427,14 +506,29 @@ class NavigationControls:
         task=self._nav_task
         if task is None:
             return
+        now=time.monotonic()
+        current=task.current_pose_available(now)
+        key=(task.last.get('sequence') if task.last else None, task.state, task.reason,
+             current,tuple(sorted(task.closed)), task.progress_notice,
+             (self._nav_diagnostic or {}).get('sequence'),self._nav_source_problem)
+        if key==self._nav_render_key:return
+        self._nav_render_key=key
         prefix='独立录像/照片回放 · ' if task.last and task.last['time_mode']=='offline_replay' else '本地当前画面 · '
         self.nav_status.value=prefix+STATES.get(task.state,task.state)+'\n'+REASONS.get(task.reason,task.reason or '')
-        current=task.current_pose_available(time.monotonic())
         if current:
             route_status='路线尚未接入' if task.state=='relocalizing' else STATES.get(task.state,task.state)
             self.nav_status.value=prefix+'当前位置已定位 · '+route_status+'\n'+REASONS.get(task.reason,task.reason or '')
         elif task.reason=='localization_required' and self._nav_error:
             self.nav_status.value=prefix+'定位计算失败：'+self._nav_error+'\n请检查启动日志；这不是已证实的画面质量问题。'
+        diagnostic=self._nav_diagnostic
+        if (diagnostic and not self._nav_source_problem and task.state=='relocalizing'
+                and task.reason in ('localization_required','stale_result','frame_stale_or_disconnected')
+                and diagnostic['pose_status']!='localized'):
+            failure=diagnostic.get('failure_reason') or diagnostic['pose_status']
+            detail='位姿质量不足' if failure=='insufficient_pnp_quality' else '未取得合格位姿：'+str(failure)
+            slow=diagnostic['received_to_evaluation_s']>task.max_age_s
+            self.nav_status.value=prefix+'本次照片定位失败：'+detail+('；计算结果同时超时。' if slow else '。')
+            self.nav_status.value+='\n这是已收到图像的计算结果，不是已证实的相机断流；未生成方向。'
         if self._nav_replay_done:
             self.nav_status.value+='\n没有生成机器人运动。'
         guidance=task.guidance
@@ -467,6 +561,8 @@ class NavigationControls:
             self.controller.pose('navigation_goal',task.plan['goal_observation_pose'],color=(45,210,70))
         else:
             self.controller.clear('navigation_route');self.controller.clear('navigation_goal')
+            if current and task.plan and task.plan['status']=='observation_region':
+                self.controller.pose('navigation_goal',task.plan['goal_observation_pose'],color=(45,210,70))
         if guidance:
             camera=next((c for c in self.controller.model['cameras'] if c['name']==guidance['reference']),None)
             if camera is None:
@@ -478,3 +574,10 @@ class NavigationControls:
                 self.nav_next.visible=False
         else:
             self.nav_next.visible=False
+        self._nav_append('ui_states.jsonl',dict(at=utc_now(),ui_applied_monotonic=time.monotonic(),
+            state=task.state,reason=task.reason,current_pose_available=current,
+            guidance_available=bool(current and task.guidance),
+            direction=task.guidance['direction'] if current and task.guidance else None,
+            sequence=task.last.get('sequence') if task.last else None,
+            source_received_monotonic=task.last.get('received_monotonic') if task.last else None,
+            ui_clock_scope='Viser_server_scene_state_not_browser_paint',execution_permitted=False))

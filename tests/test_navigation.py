@@ -51,7 +51,7 @@ class NavigationTests(unittest.TestCase):
     def test_valid_pose_still_shown_when_target_unreachable(self):
         g=setup_graph();t=NavigationTask(g,[{'node_id':'z.png','quality':1.}],up=[0,0,1])
         t.observe(observation(g,(1,2,0),('a.png','m.png')),now=1)
-        self.assertEqual(t.reason,'no_reachable_good_observation')
+        self.assertEqual(t.reason,'reverse_travel_not_enabled')
         self.assertTrue(t.current_pose_available(1))
 
     def test_auto_edges_separate_from_strict_review_and_no_shortcut(self):
@@ -99,7 +99,8 @@ class NavigationTests(unittest.TestCase):
         self.assertNotEqual(t.state, 'target_confirmed')
         t.tick(now=100)
         self.assertNotEqual(t.state, 'target_confirmed')
-        t.observe(observation(g, (2,2,0), ('a.png','m.png'), seq=2), now=2)
+        reached=observation(g, (2,2,0), ('a.png','m.png'), seq=2);reached['target_matches']=4
+        t.observe(reached, now=2)
         self.assertEqual(t.state, 'observation_region_reached')
         self.assertFalse(t.confirm(now=2))
         o = observation(g, (2,2,0), ('a.png','m.png'), seq=3); o['target_matches'] = 4
@@ -124,7 +125,8 @@ class NavigationTests(unittest.TestCase):
         t.observe(observation(g),now=1)
         t.observe(observation(g,(30,30,30),seq=2),now=2)
         self.assertIsNone(t.plan);self.assertIsNone(t.guidance)
-        t.observe(observation(g,(2,2,0),('a.png','m.png'),seq=3),now=3)
+        recovered=observation(g,(2,2,0),('a.png','m.png'),seq=3);recovered['target_matches']=4
+        t.observe(recovered,now=3)
         self.assertIsNone(t.reason)
 
     def test_turn_clips_lookahead_and_reverse_is_explicit(self):
