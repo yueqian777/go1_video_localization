@@ -36,6 +36,7 @@ class ServiceTests(unittest.TestCase):
 
     def test_worker_records_clocks_and_rejects_pre_warmup_source_frame(self):
         class Backend:
+            last_profile={'match_s':.1,'match_reuses':3}
             def localize(self,photo,output,config):return {'pose_status':'localized'}, {}, output
         with TemporaryDirectory() as temp:
             ready=time.monotonic();w=LatestFrameWorker(Backend,Path(temp),not_before_monotonic=ready)
@@ -46,6 +47,7 @@ class ServiceTests(unittest.TestCase):
                 while value is None and time.monotonic()<deadline:
                     time.sleep(.01);value=w.take()
                 clocks=value['timing']
+                self.assertEqual(value['processing_stages'],{'match_s':.1,'match_reuses':3})
                 self.assertLessEqual(clocks['source_received_monotonic'],clocks['inference_started_monotonic'])
                 self.assertLessEqual(clocks['inference_started_monotonic'],clocks['inference_finished_monotonic'])
                 self.assertLessEqual(clocks['inference_finished_monotonic'],clocks['result_taken_monotonic'])

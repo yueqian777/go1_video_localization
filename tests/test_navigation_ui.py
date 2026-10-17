@@ -63,6 +63,8 @@ class NavigationUITests(unittest.TestCase):
         self.assertNotIn('navigation_route',self.app.controller.groups)
         self.assertIn('当前位置已定位',self.app.nav_status.value)
         self.assertIn('最近候选',self.app.nav_detail.value)
+        self.assertIn('历史路线未覆盖当前定位的接入范围',self.app.nav_detail.value)
+        self.assertIn('不能直接吸附',self.app.nav_detail.value)
         with patch('go1loc.navigation_ui.time.monotonic',return_value=10):
             self.app._nav_render()
         self.assertNotIn('navigation_current',self.app.controller.groups)
@@ -87,7 +89,8 @@ class NavigationUITests(unittest.TestCase):
         self.app._nav_run=self.app.sidecar/'clock-log';self.app._nav_camera_at_start='camera6'
         self.app.target_result={'supporting_point3D_ids':[]}
         o=observation(g);o.update(time_mode='live_current',image_path='local-test.png')
-        self.app._nav_worker.take.return_value=dict(error=None,observation=o,latency_s=5.,directory='query')
+        self.app._nav_worker.take.return_value=dict(error=None,observation=o,latency_s=5.,directory='query',
+                                                  processing_stages={'match_s':2.1})
         with patch('go1loc.navigation_ui.time.monotonic',return_value=6.), patch(
                 'go1loc.viser_viewer._read_image',return_value=f.np.zeros((2,2,3),dtype=f.np.uint8)):
             self.app._nav_tick()
@@ -98,6 +101,7 @@ class NavigationUITests(unittest.TestCase):
         self.assertEqual(event['observation_metadata']['received_monotonic'],1.)
         self.assertEqual(event['evaluated_monotonic'],6.)
         self.assertEqual(event['adoption'],'rejected')
+        self.assertEqual(event['processing_stages'],{'match_s':2.1})
         self.assertEqual(event['adoption_reason'],'stale_result')
         self.assertEqual(event['timing']['ui_applied_monotonic'],6.)
         self.assertTrue((self.app._nav_run/'guidance_events.jsonl').is_file())

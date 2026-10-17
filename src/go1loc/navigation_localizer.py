@@ -4,7 +4,9 @@ Uses the pinned hloc preprocessing, SuperPoint, LightGlue and PyCOLMAP evidence
 export. Reference features and models stay resident; research CLI is unchanged.
 """
 from copy import deepcopy
+from contextlib import contextmanager
 from dataclasses import asdict
+import hashlib
 import json
 from pathlib import Path
 import threading
@@ -77,29 +79,78 @@ class ResidentLocalizer:
             self.model_loads += 1
         return self.models[key]
 
+    @contextmanager
+    def query_reuse(self):
+        """Reuse exact algorithm inputs only within ONE local/global attempt.
+
+        Never carry a current observation into the next frame, even on error.
+        Raw extraction is cached before feature masks; matching keys include
+        the final filtered arrays, not the basename or the source photo alone.
+        """
+        if getattr(self, '_query_reuse', None) is not None:
+            raise RuntimeError('overlapping_resident_queries')
+        self._query_reuse = {'features': {}, 'matches': {}}
+        self.last_profile = dict(extract_s=0., match_s=0., extractions=0,
+                                 extraction_reuses=0, match_pairs=0, match_reuses=0)
+        try:
+            yield
+        finally:
+            self._query_reuse = None
+
+    def _record_stage(self, stage, started, **counts):
+        profile = getattr(self, 'last_profile', None)
+        if profile is not None:
+            profile[stage] = profile.get(stage, 0.) + time.perf_counter()-started
+            for k, v in counts.items():
+                profile[k] = profile.get(k, 0) + v
+
+    def cluster_solver(self, localizer, query_name, features, read_matches):
+        from .localization import _CachedClusterSolver
+        return _CachedClusterSolver(localizer, query_name, features, read_matches)
+
+    def covisibility_clusters(self, image_ids):
+        # Connectivity belongs to the verified frozen map, not the query.
+        # Preserve even the input order because it defines correspondence order.
+        from hloc.localize_sfm import do_covisibility_clustering
+        if not hasattr(self,'_cluster_cache'):self._cluster_cache={}
+        key=tuple(image_ids)
+        if key not in self._cluster_cache:
+            if len(self._cluster_cache)>=32:self._cluster_cache.pop(next(iter(self._cluster_cache)))
+            self._cluster_cache[key]=do_covisibility_clustering(image_ids,self.reconstruction)
+        return deepcopy(self._cluster_cache[key])
+
     def extract(self, conf, image_dir, export_dir, *, image_list, feature_path, overwrite):
         import torch, h5py
         from hloc import extractors
         model = self._model(extractors,conf['model'])
         dataset = self.extract_module.ImageDataset(image_dir,conf['preprocessing'],image_list)
+        started = time.perf_counter(); computed = reused = 0
+        cache = getattr(self, '_query_reuse', None)
+        cache = cache['features'] if cache is not None else {}
         with torch.inference_mode(), h5py.File(feature_path,'w') as f:
             for i,name in enumerate(dataset.names):
-                data = dataset[i]
-                tensor = torch.from_numpy(data['image']).unsqueeze(0).to(self.device)
-                pred = {k:v[0].cpu().numpy() for k,v in model({'image':tensor}).items()}
-                pred['image_size'] = original = np.asarray(data['original_size'])
-                uncertainty = 1.
-                if 'keypoints' in pred:
-                    scales = (original/np.asarray(tensor.shape[-2:][::-1])).astype(np.float32)
-                    pred['keypoints'] = (pred['keypoints']+.5)*scales[None]-.5
-                    if 'scales' in pred:
-                        pred['scales'] *= scales.mean()
-                    uncertainty = getattr(model,'detection_noise',1)*scales.mean()
+                key = (sha256_file(Path(image_dir)/name), json.dumps(conf,sort_keys=True))
+                if key in cache:
+                    pred, uncertainty = cache[key]; reused += 1
+                else:
+                    data = dataset[i]
+                    tensor = torch.from_numpy(data['image']).unsqueeze(0).to(self.device)
+                    pred = {k:v[0].cpu().numpy() for k,v in model({'image':tensor}).items()}
+                    pred['image_size'] = original = np.asarray(data['original_size'])
+                    uncertainty = 1.
+                    if 'keypoints' in pred:
+                        scales = (original/np.asarray(tensor.shape[-2:][::-1])).astype(np.float32)
+                        pred['keypoints'] = (pred['keypoints']+.5)*scales[None]-.5
+                        if 'scales' in pred:
+                            pred['scales'] *= scales.mean()
+                        uncertainty = getattr(model,'detection_noise',1)*scales.mean()
+                    cache[key] = (pred, uncertainty); computed += 1
                 group = f.create_group(name)
                 for k,v in pred.items():
                     group.create_dataset(k,data=v.astype(np.float16) if v.dtype == np.float32 else v)
                 if 'keypoints' in group:
                     group['keypoints'].attrs['uncertainty'] = uncertainty
+        self._record_stage('extract_s',started,extractions=computed,extraction_reuses=reused)
         return feature_path
 
     def match(self, conf, pairs, *, features, features_ref, matches, overwrite):
@@ -107,22 +158,47 @@ class ResidentLocalizer:
         from hloc import matchers
         from hloc.utils.parsers import parse_retrieval, names_to_pair
         model = self._model(matchers,conf['model'])
+        started = time.perf_counter(); computed = reused = 0
+        cache = getattr(self, '_query_reuse', None)
+        cache = cache['matches'] if cache is not None else {}
+        def tensors(source, suffix):
+            data = {k+suffix:torch.from_numpy(v.copy()).float().unsqueeze(0).to(self.device)
+                    for k,v in source.items()}
+            data['image'+suffix] = torch.empty((1,1,*tuple(source['image_size'])[::-1]))
+            return data
         with torch.inference_mode(), h5py.File(features,'r') as qf, h5py.File(matches,'w') as mf:
             for q, refs in parse_retrieval(pairs).items():
                 qdata = {k:np.asarray(v) for k,v in qf[q].items()}
+                fingerprint = hashlib.sha256()
+                for k,v in sorted(qdata.items()):
+                    fingerprint.update(repr((k,v.dtype.str,v.shape)).encode())
+                    fingerprint.update(v.tobytes())
+                query_key = (fingerprint.hexdigest(),json.dumps(conf,sort_keys=True))
+                query_tensors = tensors(qdata,'0')
                 for ref in refs:
-                    data = {}
-                    for suffix, source in [('0',qdata),('1',self.reference_features[ref])]:
-                        for k,v in source.items():
-                            data[k+suffix] = torch.from_numpy(v.copy()).float().unsqueeze(0).to(self.device)
-                        data['image'+suffix] = torch.empty((1,1,*tuple(source['image_size'])[::-1]))
-                    pred = model(data); group = mf.create_group(names_to_pair(q,ref))
-                    group.create_dataset('matches0',data=pred['matches0'][0].cpu().short().numpy())
-                    if 'matching_scores0' in pred:
-                        group.create_dataset('matching_scores0',data=pred['matching_scores0'][0].cpu().half().numpy())
+                    key = (query_key,ref)
+                    if key in cache:
+                        prediction = cache[key]; reused += 1
+                    else:
+                        pred = model({**query_tensors,**tensors(self.reference_features[ref],'1')})
+                        prediction = {'matches0':pred['matches0'][0].cpu().short().numpy()}
+                        if 'matching_scores0' in pred:
+                            prediction['matching_scores0'] = pred['matching_scores0'][0].cpu().half().numpy()
+                        cache[key] = prediction; computed += 1
+                    group = mf.create_group(names_to_pair(q,ref))
+                    for k,v in prediction.items():group.create_dataset(k,data=v)
+        self._record_stage('match_s',started,match_pairs=computed,match_reuses=reused)
         return matches
 
     def localize(self, photo, output, config=None):
+        with self.query_reuse():
+            started = time.perf_counter()
+            try:
+                return self._localize(photo, output, config)
+            finally:
+                self.last_profile['total_s'] = time.perf_counter()-started
+
+    def _localize(self, photo, output, config=None):
         from .localization import localize_photo
         output = Path(output)
         # Local reference subgraph first; global retrieval/all-reference fallback.
@@ -135,7 +211,9 @@ class ResidentLocalizer:
         if result is None or result.pose_status != 'localized':
             directory = output/'global'
             result = localize_photo(Path(photo),self.map_dir,directory,config,resident=self)
+        started = time.perf_counter()
         value, evidence = verified_localization(directory,self.manifest['manifest_sha256'])
+        self._record_stage('verify_s', started)
         if value['pose_status'] == 'localized':
             refs = value['matched_references']
             ordered = list(self.reference_features)
@@ -238,7 +316,8 @@ class LatestFrameWorker:
                 started=time.monotonic()
                 result,evidence,directory=self.backend.localize(photo,self.output/uuid4().hex,config)
                 value={'observation':{**result,**metadata,'image_path':str(photo)},'directory':str(directory),
-                       'latency_s':time.monotonic()-started,'error':None}
+                       'latency_s':time.monotonic()-started,'error':None,
+                       'processing_stages':deepcopy(getattr(self.backend,'last_profile',None))}
             except Exception as exc:
                 value={'error':str(exc),'metadata':metadata,'latency_s':time.monotonic()-(started or submitted)}
             finished=time.monotonic()
@@ -252,6 +331,7 @@ class LatestFrameWorker:
                 if generation==self.generation and not self.closed:
                     if self.completed:self._record('replaced',self.completed.get('metadata'),reason='newer_completed_result')
                     self.completed=value
-                    self._record('completed',metadata,timing=value['timing'],error=value['error'])
+                    self._record('completed',metadata,timing=value['timing'],error=value['error'],
+                                 processing_stages=value.get('processing_stages'))
                 else:
                     self._record('rejected',metadata,reason='late_generation_result',timing=value['timing'])

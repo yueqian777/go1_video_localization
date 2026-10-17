@@ -6,6 +6,7 @@ import json
 import os
 import shutil
 import time
+from collections import defaultdict
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from functools import lru_cache
@@ -178,6 +179,53 @@ def _save_result(output_dir: Path, result: LocalizationResult) -> LocalizationRe
     return result
 
 
+class _CachedClusterSolver:
+    """Pinned hloc pose_from_cluster input assembly with per-query IO reuse.
+
+    Adapted from Apache-2.0 hloc; see THIRD_PARTY_NOTICES.md.
+
+    Retains hloc's +0.5 coordinates, insertion order, conflicting 3D hypotheses
+    and db-offset lists. The upstream QueryLocalizer/PyCOLMAP estimator is called
+    for EVERY candidate with unchanged options and order; estimated poses are
+    deliberately NOT cached because that would change the random-solver stream.
+    """
+    def __init__(self, localizer, query_name, features_path, read_matches):
+        from hloc.utils.io import get_keypoints
+        self.localizer = localizer
+        self.keypoints = get_keypoints(features_path, query_name)+0.5
+        self.read_matches = read_matches
+        self.references = {}
+
+    def __call__(self, camera, db_ids):
+        ids_by_keypoint = defaultdict(list)
+        db_by_keypoint = defaultdict(lambda: defaultdict(list))
+        num_matches = 0
+        for offset, db_id in enumerate(db_ids):
+            if db_id not in self.references:
+                image = self.localizer.reconstruction.images[db_id]
+                if image.num_points3D == 0:
+                    self.references[db_id] = []
+                else:
+                    pids = np.array([p.point3D_id if p.has_point3D() else -1 for p in image.points2D])
+                    matches, _ = self.read_matches(image.name)
+                    matches = matches[pids[matches[:,1]] != -1]
+                    self.references[db_id] = [(idx,pids[m]) for idx,m in matches]
+            matches = self.references[db_id]; num_matches += len(matches)
+            for idx, pid in matches:
+                db_by_keypoint[idx][pid].append(offset)
+                if pid not in ids_by_keypoint[idx]:
+                    ids_by_keypoint[idx].append(pid)
+        idxs = list(ids_by_keypoint)
+        indices = [i for i in idxs for _ in ids_by_keypoint[i]]
+        pids = [pid for i in idxs for pid in ids_by_keypoint[i]]
+        ret = self.localizer.localize(self.keypoints, indices, pids, camera)
+        if ret is not None:ret['camera'] = camera
+        return ret, dict(db=db_ids, PnP_ret=ret, keypoints_query=self.keypoints[indices],
+            points3D_ids=pids, points3D_xyz=None, num_matches=num_matches,
+            keypoint_index_to_db=(indices,[(pid,db_by_keypoint[i][pid])
+                                          for i in idxs for pid in ids_by_keypoint[i]]))
+
+
 def localize_photo(query_path: Path, map_dir: Path, output_dir: Path, config: LocalizationConfig | None = None,
                    *, resident=None, reference_names=None) -> LocalizationResult:
     total_started = time.perf_counter()
@@ -310,7 +358,11 @@ def localize_photo(query_path: Path, map_dir: Path, output_dir: Path, config: Lo
             db_ids.append(image.image_id)
     if not db_ids:
         return _save_result(output_dir, LocalizationResult.failure(query_id=query_name, map_id=map_id, reason="insufficient_no_retrieved_reference"))
-    clusters = localize_sfm.do_covisibility_clustering(db_ids, model)
+    cluster_started = time.perf_counter()
+    clusters = (resident.covisibility_clusters(db_ids) if hasattr(resident,'covisibility_clusters')
+                else localize_sfm.do_covisibility_clustering(db_ids, model))
+    if hasattr(resident,'_record_stage'):
+        resident._record_stage('covisibility_s',cluster_started)
     candidates = []
     all_evidence = []
     started = time.perf_counter()
@@ -321,20 +373,24 @@ def localize_photo(query_path: Path, map_dir: Path, output_dir: Path, config: Lo
     def read_matches(name):
         return get_matches(query_matches, query_name, name)
 
+    cached_solver = (resident.cluster_solver(localizer, query_name, local_query, read_matches)
+                     if hasattr(resident, 'cluster_solver') else None)
+
     def solve(cluster, strategy='covisibility_component'):
+        solve_started = time.perf_counter()
         index = len(all_evidence)
         # Each estimator may refine its camera. Preserve the camera used by each pose.
         cluster_camera = pycolmap.Camera(camera.todict())
-        ret, log = localize_sfm.pose_from_cluster(
-            localizer,
-            query_name,
-            cluster_camera,
-            cluster,
-            local_query,
-            query_matches,
-        )
+        if cached_solver is not None:
+            ret, log = cached_solver(cluster_camera, cluster)
+        else:
+            ret, log = localize_sfm.pose_from_cluster(
+                localizer, query_name, cluster_camera, cluster, local_query, query_matches)
         if not cluster_camera.verify_params() or not np.isfinite(cluster_camera.params).all():
             raise PipelineInputError('invalid_estimated_query_camera_parameters')
+        if hasattr(resident, '_record_stage'):
+            resident._record_stage('pnp_inputs_and_solve_s',solve_started,pose_candidates=1)
+        export_started = time.perf_counter()
         rows = export_rows(model, log, ret, cluster_camera, read_matches)
         raw_uv = original_coordinates([r['uv'] for r in rows], rectification)
         for row, uv in zip(rows, raw_uv):
@@ -345,6 +401,8 @@ def localize_photo(query_path: Path, map_dir: Path, output_dir: Path, config: Lo
                              'num_matches': int(log['num_matches']), 'rows': rows,
                              'camera': {'model': cluster_camera.model.name, 'width': cluster_camera.width,
                                         'height': cluster_camera.height, 'params': cluster_camera.params.tolist()}})
+        if hasattr(resident, '_record_stage'):
+            resident._record_stage('export_rows_s',export_started)
         if ret is None:
             return None
         quality = _quality(ret, len(log.get("points3D_ids", [])))
@@ -363,9 +421,13 @@ def localize_photo(query_path: Path, map_dir: Path, output_dir: Path, config: Lo
             candidates.append(candidate)
     recovery = []
     if not any(_passes_quality(c['quality'], config) for c in candidates):
+        recovery_started = time.perf_counter()
         recovery = _reference_consensus_candidates(clusters, all_evidence, solve, config)
+        if hasattr(resident, '_record_stage'):
+            resident._record_stage('consensus_including_solves_s',recovery_started)
         geometry['reference_consensus_policy'] = {**REFERENCE_CONSENSUS_POLICY, 'top_k': config.top_k}
     def finish(result, selected=None):
+        finish_started = time.perf_counter()
         result.map_hash = manifest['manifest_sha256']
         result.capture_time = config.capture_time
         result.localization_time = datetime.now(timezone.utc).isoformat()
@@ -388,7 +450,11 @@ def localize_photo(query_path: Path, map_dir: Path, output_dir: Path, config: Lo
         # Saved current-start import must not accept a hand-edited XYZ result.
         evidence['localization_result_sha256'] = digest_json(result.to_dict())
         evidence['evidence_sha256'] = digest_json(evidence)
-        write_json(output_dir/'query_evidence.json', evidence)
+        # The full audit evidence is retained; indentation alone is expensive
+        # on the resident critical path and does not participate in JSON digests.
+        write_json(output_dir/'query_evidence.json', evidence, compact=resident is not None)
+        if hasattr(resident, '_record_stage'):
+            resident._record_stage('seal_and_write_evidence_s',finish_started)
         return _save_result(output_dir, result)
     if recovery:
         best = recovery[0]

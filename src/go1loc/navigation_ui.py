@@ -466,7 +466,8 @@ class NavigationControls:
                 'evaluated_monotonic':time.monotonic(),
                 'query_directory':completed.get('directory'),'error':completed['error'],
                 'localization_diagnostic':self._nav_diagnostic,
-                'timing':dict(completed.get('timing') or {})}
+                'timing':dict(completed.get('timing') or {}),
+                'processing_stages':completed.get('processing_stages')}
         task.tick(time.monotonic())
         self._nav_render()
         if event:
@@ -554,6 +555,8 @@ class NavigationControls:
             self.nav_detail.value+=(f"\n最近候选 {nearest['edge_id']}：距离 {nearest['distance']:.3f} / "
                 f"门限 {nearest['distance_limit']:.3f} {task.graph['units']}；"+
                 '、'.join(reasons[r] for r in nearest['rejection_reasons']))
+            if nearest['distance']>nearest['distance_limit']:
+                self.nav_detail.value+='\n历史路线未覆盖当前定位的接入范围；定位通过不等于路线已连接，不能直接吸附。'
         if current:
             self.controller.pose('navigation_current',task.last['T_WC_query'],color=(255,130,0))
         else:

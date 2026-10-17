@@ -137,7 +137,8 @@ def main():
                 before=dict(status=old['pose_status'],quality=old['quality'],state=event.get('state'),reason=event.get('reason')),
                 after=dict(status=value['pose_status'],reason=value.get('failure_reason'),quality=value['quality'],
                            T_WC_query=value.get('T_WC_query'),matched_references=value['matched_references']),
-                processing_s=elapsed,association=association,plan=plan,shadow=shadow,execution_permitted=False)
+                processing_s=elapsed,processing_stages=getattr(backend,'last_profile',None),
+                association=association,plan=plan,shadow=shadow,execution_permitted=False)
             rows.append(row)
             with (args.output/'results.jsonl').open('a',encoding='utf-8') as f:
                 f.write(json.dumps(row,ensure_ascii=False,allow_nan=False)+'\n')

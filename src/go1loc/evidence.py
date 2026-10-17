@@ -20,10 +20,11 @@ def resolve_map_path(map_dir: Path, value):
     return path.resolve() if path.is_absolute() else (map_dir/path).resolve()
 
 
-def write_json(path: Path, payload):
+def write_json(path: Path, payload, *, compact=False):
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary = path.with_suffix(path.suffix + '.tmp')
-    temporary.write_text(json.dumps(payload, indent=2, ensure_ascii=False, allow_nan=False), encoding='utf-8')
+    temporary.write_text(json.dumps(payload, indent=None if compact else 2,
+                                   ensure_ascii=False, allow_nan=False), encoding='utf-8')
     temporary.replace(path)
 
 
