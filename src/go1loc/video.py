@@ -24,6 +24,12 @@ class VideoPipelineError(RuntimeError):
     pass
 
 
+def _background_process_options():
+    # GUI launchers have no console. Do not open a transient console or inherit
+    # interactive stdin when probing/decoding; stderr is captured by each caller.
+    return dict(stdin=subprocess.DEVNULL,creationflags=getattr(subprocess,'CREATE_NO_WINDOW',0))
+
+
 @dataclass
 class VideoProbe:
     source_path: str
@@ -77,7 +83,8 @@ def _ffprobe_json(path: Path) -> dict[str, Any]:
         "-show_streams",
         str(path),
     ]
-    completed = subprocess.run(command, capture_output=True, text=True, timeout=60, check=False)
+    completed = subprocess.run(command, capture_output=True, text=True, timeout=60, check=False,
+                               **_background_process_options())
     if completed.returncode != 0:
         raise VideoPipelineError(f"ffprobe_failed:{completed.stderr[-500:]}")
     try:
@@ -262,16 +269,16 @@ def _prepare_video(path, output_dir, config, calibration_path, events) -> dict:
     output_dir.mkdir(parents=True,exist_ok=True)
     for folder in ('raw','images'):
         (output_dir/folder).mkdir()
-    raw = subprocess.run([shutil.which('ffprobe') or 'ffprobe','-v','error','-select_streams','v:0','-read_intervals',f'%+{config.start_s+config.duration_s}', '-show_frames','-show_entries','frame=pts,best_effort_timestamp_time,pts_time','-of','json',str(path.resolve())],capture_output=True,text=True,encoding='utf-8',timeout=180)
+    raw = subprocess.run([shutil.which('ffprobe') or 'ffprobe','-v','error','-select_streams','v:0','-read_intervals',f'%+{config.start_s+config.duration_s}', '-show_frames','-show_entries','frame=pts,best_effort_timestamp_time,pts_time','-of','json',str(path.resolve())],capture_output=True,text=True,encoding='utf-8',timeout=180,**_background_process_options())
     if raw.returncode:
-        raise VideoPipelineError('frame_probe_failed:'+raw.stderr[-500:])
+        raise VideoPipelineError(f'frame_probe_failed:exit={raw.returncode}:'+raw.stderr[-500:])
     selected = select_frame_records(json.loads(raw.stdout).get('frames',[]),config)
     if not selected:
         raise VideoPipelineError('no_frames_in_requested_time_window')
     filt = 'select='+ '+'.join(f'eq(n\\,{r["frame_index"]})' for r in selected)
     command = [shutil.which('ffmpeg') or 'ffmpeg','-v','error','-nostdin','-noautorotate','-i',str(path.resolve()),'-map','0:v:0','-t',str(config.start_s+config.duration_s),'-vf',filt,'-fps_mode','vfr','-frames:v',str(len(selected)),str(output_dir/'raw'/'%06d.png')]
     with events.stage('video_decode'):
-        decoded = subprocess.run(command,capture_output=True,text=True,encoding='utf-8',timeout=600)
+        decoded = subprocess.run(command,capture_output=True,text=True,encoding='utf-8',timeout=600,**_background_process_options())
         if decoded.returncode:
             raise VideoPipelineError('decode_failed:'+decoded.stderr[-500:])
     files = sorted((output_dir/'raw').glob('*.png'))

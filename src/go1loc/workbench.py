@@ -77,7 +77,7 @@ class WorkbenchBridge:
             task = app._nav_task
             last = task.last if task else None
             pose_available = bool(state['live'] and frame and task and last
-                and task.state in ('following', 'turning', 'planned', 'observation_region_reached', 'target_confirmed')
+                and task.current_pose_available(time.monotonic())
                 and last.get('time_mode') == 'live_current' and last.get('pose_status') == 'localized'
                 and last.get('session_id') == frame.header['session_id']
                 and last.get('camera_id') == 'camera' + str(frame.header['camera_id'])

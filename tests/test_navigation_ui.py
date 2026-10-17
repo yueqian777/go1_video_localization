@@ -12,6 +12,32 @@ from go1loc.navigation import NavigationTask
 class NavigationUITests(unittest.TestCase):
     setUp=f.ApplicationTests.setUp
 
+    def test_off_route_pose_visible_but_old_route_retired_and_age_checked(self):
+        from test_navigation import setup_graph, observation
+        g=setup_graph();task=NavigationTask(g,[dict(node_id='m.png',quality=1.)],up=[0,0,1])
+        self.app._nav_task=task
+        o=observation(g,(20,20,20));o['time_mode']='live_current'
+        task.observe(o,now=1)
+        with patch('go1loc.navigation_ui.time.monotonic',return_value=1):
+            self.app._nav_render()
+        self.assertIn('navigation_current',self.app.controller.groups)
+        self.assertNotIn('navigation_route',self.app.controller.groups)
+        self.assertIn('当前位置已定位',self.app.nav_status.value)
+        with patch('go1loc.navigation_ui.time.monotonic',return_value=10):
+            self.app._nav_render()
+        self.assertNotIn('navigation_current',self.app.controller.groups)
+
+    def test_model_error_is_not_replaced_by_bad_photo_advice(self):
+        from test_navigation import setup_graph
+        task=NavigationTask(setup_graph(),[],up=[0,0,1])
+        self.app._nav_task=task;self.app._nav_worker=Mock();self.app._nav_source=None
+        self.app._nav_run=self.app.sidecar/'run'
+        self.app._nav_worker.take.return_value={'error':'model initialization failed','latency_s':.1}
+        self.app._nav_tick()
+        self.assertIn('model initialization failed',self.app.nav_status.value)
+        self.assertNotIn('更多环境细节',self.app.nav_status.value)
+        self.assertNotIn('navigation_current',self.app.controller.groups)
+
     def test_default_ui_has_normal_controls_not_json_entry(self):
         labels=[x for x in self.server.gui.labels if isinstance(x,str)]
         for label in ('开始方向引导（不控制机器狗）','暂停引导','取消任务','上传单张当前位置照片'):

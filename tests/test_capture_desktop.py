@@ -1,9 +1,10 @@
 import tempfile
+import sys
 import threading
 import time
 import unittest
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 from go1loc.capture_desktop import existing_capture, load_settings, main, run_capture
 from go1loc.capture_web import CaptureWeb
@@ -12,6 +13,35 @@ from go1loc.jobs import atomic_json, read_json
 
 
 class CaptureDesktopTests(unittest.TestCase):
+    def test_pythonw_missing_streams_support_library_flush_and_restore(self):
+        with tempfile.TemporaryDirectory() as t:
+            config = Path(t) / 'launcher.json'
+            for missing in ('stdout', 'stderr', 'both'):
+                original = (sys.stdout, sys.stderr)
+                def library_start(*args, **kwargs):
+                    sys.stdout.write('model initialized\n'); sys.stdout.flush()
+                    sys.stderr.write('library diagnostic\n'); sys.stderr.flush()
+                streams = {key: None for key in ('stdout', 'stderr') if missing in (key, 'both')}
+                with patch.multiple(sys, **streams), patch(
+                        'go1loc.capture_desktop.run_capture', side_effect=library_start), patch(
+                        'ctypes.windll', new=Mock(), create=True):
+                    self.assertEqual(main(['--config', str(config), '--no-browser']), 0)
+                    for key in streams:
+                        self.assertIsNone(getattr(sys, key))
+                self.assertEqual((sys.stdout, sys.stderr), original)
+            self.assertIn('model initialized', config.with_suffix('.log').read_text(encoding='utf-8'))
+            self.assertIn('library diagnostic', config.with_suffix('.log').read_text(encoding='utf-8'))
+
+    def test_pythonw_error_restores_missing_streams_and_keeps_log(self):
+        with tempfile.TemporaryDirectory() as t:
+            config=Path(t)/'launcher.json'
+            with patch.multiple(sys,stdout=None,stderr=None), patch(
+                    'ctypes.windll',new=Mock(),create=True), patch(
+                    'go1loc.capture_desktop.run_capture',side_effect=RuntimeError('model failure')):
+                self.assertEqual(main(['--config',str(config),'--no-browser']),1)
+                self.assertIsNone(sys.stdout);self.assertIsNone(sys.stderr)
+            self.assertIn('model failure',config.with_suffix('.log').read_text(encoding='utf-8'))
+
     def test_settings_and_no_auto_connection(self):
         with tempfile.TemporaryDirectory() as t:
             config = Path(t) / 'launcher.json'

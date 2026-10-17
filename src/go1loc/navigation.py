@@ -138,7 +138,8 @@ def associate_route(graph, observation, previous=None):
         v = b-a; size = float(v@v)
         t = float(np.clip((p-a)@v/max(size,1e-12),0,1))
         q = a+t*v; d = float(np.linalg.norm(p-q))
-        support = len(refs.intersection((edge['from'],edge['to'])))
+        support = sum(n in refs or len(refs.intersection(
+            graph['nodes'][n].get('localization_references',[]))) >= 2 for n in (edge['from'],edge['to']))
         heading = max(float(pose[:3,2] @ _rigid(graph['nodes'][n]['T_MC'])[:3,2]) for n in (edge['from'],edge['to']))
         if d > 2*step or not support or heading < -.5:
             continue
@@ -228,6 +229,27 @@ class NavigationTask:
             return
         if self.last and self.last['time_mode'] == 'live_current' and now-self.last['received_monotonic'] > self.max_age_s:
             self.state = 'relocalizing'; self.guidance = None; self.reason = 'frame_stale_or_disconnected'
+            self.plan = None
+
+    def current_pose_available(self, now):
+        """A verified fresh camera pose is not contingent on finding a route."""
+        if self.state in ('locating','paused','cancelled','failed') or not self.last:
+            return False
+        if self.reason not in (None, 'off_route', 'ambiguous_branch',
+                'branch_change_needs_second_observation', 'no_reachable_good_observation',
+                'no_observed_progress', 'current_segment_closed', 'heading_undefined'):
+            return False
+        o = self.last
+        if (o.get('pose_status') != 'localized' or o.get('evidence_verified') is not True
+                or any(o.get(k) != self.graph[k] for k in ('map_hash','component_id'))):
+            return False
+        if o.get('time_mode') not in ('live_current', 'offline_replay'):
+            return False
+        try:
+            _rigid(o['T_WC_query'])
+            return o['time_mode'] != 'live_current' or 0 <= now-float(o['received_monotonic']) <= self.max_age_s
+        except (ValueError, TypeError, KeyError):
+            return False
 
     def close_edge(self, edge_id):
         if edge_id not in self.graph['edges']:
@@ -239,13 +261,13 @@ class NavigationTask:
             return
         if self.last:
             if any(observation.get(k) != self.last.get(k) for k in ('session_id','camera_id','time_mode')):
-                self.state = 'relocalizing'; self.guidance = None; self.reason = 'source_changed_restart_required'; return
+                self.state = 'relocalizing'; self.guidance = None; self.plan = None; self.reason = 'source_changed_restart_required'; return
             if observation['sequence'] <= self.last['sequence']:
                 return
         if observation['time_mode'] == 'live_current' and not 0 <= now-observation['received_monotonic'] <= self.max_age_s:
-            self.state='relocalizing'; self.guidance=None; self.reason='stale_result'; return
+            self.state='relocalizing'; self.guidance=None; self.plan=None; self.reason='stale_result'; return
         if self.last and observation['query_sha256'] == self.last['query_sha256']:
-            self.state='relocalizing'; self.guidance=None; self.reason='unchanged_pixels_static_or_frozen'; return
+            self.state='relocalizing'; self.guidance=None; self.plan=None; self.reason='unchanged_pixels_static_or_frozen'; return
         self.last = deepcopy(observation)
         a = associate_route(self.graph, observation, self.association)
         self.association = a

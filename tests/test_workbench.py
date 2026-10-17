@@ -66,6 +66,20 @@ class LiveReaderTests(unittest.TestCase):
 class BridgeTests(unittest.TestCase):
     setUp=vf.ApplicationTests.setUp
 
+    def test_summary_reports_verified_pose_even_when_off_route(self):
+        from test_navigation import setup_graph, observation
+        from go1loc.navigation import NavigationTask
+        bridge=self.bridge();source=real_frame();self.source.on_frame(source)
+        g=setup_graph();task=NavigationTask(g,[],up=[0,0,1])
+        o=observation(g,(20,20,20));o.update(time_mode='live_current',camera_id='camera1',
+            session_id=source.header['session_id'],received_monotonic=source.pc_receive_monotonic)
+        task.observe(o,now=time.monotonic());self.app._nav_task=task
+        self.assertEqual(task.reason,'off_route')
+        self.assertTrue(bridge.summary()['current_pose_available'])
+        task.last['session_id']='another-session'
+        self.assertFalse(bridge.summary()['current_pose_available'])
+
+
     def bridge(self):
         self.server.get_port=lambda: 8781
         self.controller=CaptureController();self.source=ManualSource()

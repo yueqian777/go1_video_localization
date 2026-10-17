@@ -1,5 +1,6 @@
 """Single-instance launcher for the local recording dashboard; no auto-connect."""
 import argparse
+import io
 import json
 import logging
 import os
@@ -14,6 +15,26 @@ from urllib.request import ProxyHandler, build_opener
 from .capture_web import CaptureWeb
 from .desktop import InstanceLock, available_port, instance_key
 from .jobs import atomic_json, read_json
+
+
+class _LogStream(io.TextIOBase):
+    """Supply pythonw's missing stdio without retaining a rotated file handle."""
+    def __init__(self, handler):
+        self.handler = handler
+
+    @property
+    def encoding(self):
+        return 'utf-8'
+
+    def write(self, text):
+        if text.strip():
+            # Direct handler dispatch avoids logging -> stderr -> logging loops.
+            self.handler.handle(logging.LogRecord('library.stdio', logging.INFO,
+                                '', 0, text.rstrip(), (), None))
+        return len(text)
+
+    def flush(self):
+        self.handler.flush()
 
 
 def load_settings(path):
@@ -112,16 +133,24 @@ def main(argv=None):
     handler.setFormatter(logging.Formatter('%(asctime)s %(levelname)s %(message)s'))
     logging.getLogger().addHandler(handler)
     logging.getLogger().setLevel(logging.INFO)
+    original_stdout, original_stderr = sys.stdout, sys.stderr
+    stream = _LogStream(handler)
+    if sys.stdout is None:
+        sys.stdout = stream
+    if sys.stderr is None:
+        sys.stderr = stream
     try:
         run_capture(args.config, open_browser=not args.no_browser, stop=args.stop)
         return 0
     except Exception:  # noqa: BLE001 - show a recoverable launch failure under pythonw
         logging.exception('Unable to start capture dashboard')
-        if os.name == 'nt' and sys.stderr is None:
+        if os.name == 'nt' and original_stderr is None:
             import ctypes
             ctypes.windll.user32.MessageBoxW(None, '相机录制台未能启动，请查看日志：\n' + str(log_path), 'Go1 相机录制台', 0x10)
         return 1
     finally:
+        sys.stdout, sys.stderr = original_stdout, original_stderr
+        stream.flush()
         logging.getLogger().removeHandler(handler)
         handler.close()
 

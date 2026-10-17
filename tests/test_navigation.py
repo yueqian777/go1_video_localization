@@ -27,6 +27,33 @@ def observation(g, xyz=(0, 1, 0), refs=('z.png', 'a.png'), seq=1):
 
 
 class NavigationTests(unittest.TestCase):
+    def test_valid_pose_display_is_independent_of_route_failure(self):
+        g = setup_graph()
+        t = NavigationTask(g, [{'node_id':'m.png','quality':1.}], up=[0,0,1])
+        o = observation(g, (20,20,20)); o['time_mode'] = 'live_current'
+        t.observe(o, now=1)
+        self.assertEqual(t.reason, 'off_route')
+        self.assertTrue(t.current_pose_available(1))
+        self.assertIsNone(t.plan)
+        self.assertFalse(t.current_pose_available(5))
+        for reason in ('source_changed_restart_required', 'localization_required', 'stale_result',
+                       'unchanged_pixels_static_or_frozen', 'frame_stale_or_disconnected'):
+            t.reason = reason
+            self.assertFalse(t.current_pose_available(1), reason)
+        t.reason = 'off_route'
+        for key, value in [('map_hash','other'), ('component_id','other'),
+                           ('evidence_verified',False), ('T_WC_query',None)]:
+            saved=t.last[key];t.last[key]=value
+            self.assertFalse(t.current_pose_available(1), key)
+            t.last[key]=saved
+        t.pause();self.assertFalse(t.current_pose_available(1))
+
+    def test_valid_pose_still_shown_when_target_unreachable(self):
+        g=setup_graph();t=NavigationTask(g,[{'node_id':'z.png','quality':1.}],up=[0,0,1])
+        t.observe(observation(g,(1,2,0),('a.png','m.png')),now=1)
+        self.assertEqual(t.reason,'no_reachable_good_observation')
+        self.assertTrue(t.current_pose_available(1))
+
     def test_auto_edges_separate_from_strict_review_and_no_shortcut(self):
         g = setup_graph()
         self.assertEqual(len(g['edges']), 2)

@@ -15,7 +15,7 @@ STATES={'locating':'正在定位','planned':'路线已规划','turning':'请按�
     'relocalizing':'需要重新观察','blocked':'路线受阻','observation_region_reached':'已到观察区，等待新画面确认目标',
     'target_confirmed':'新画面已复现目标几何证据','paused':'已暂停','cancelled':'已取消','failed':'任务失败'}
 REASONS={'ambiguous_branch':'附近有多段相似路线，请换一个视角，再观察前方与两侧。',
-    'off_route':'当前位置不在可信历史路段附近，请先遥控回到熟悉路段。',
+    'off_route':'已测得相机位姿，但尚未满足历史路段的接入条件；不自动吸附，也不生成方向。',
     'frame_stale_or_disconnected':'画面已过期或断开，方向提示已撤销。请检查本地采集页。',
     'no_reachable_good_observation':'当前方向无法到达优质目标观察区；请检查断点、单向路段或另选目标。',
     'unchanged_pixels_static_or_frozen':'画面内容重复，可能静止或冻结；不会据此推进路线。',
@@ -36,6 +36,7 @@ class NavigationControls:
         self._nav_generation=0;self._nav_worker=None;self._nav_task=None;self._nav_source=None
         self._nav_graph=None;self._nav_preparing=False;self._nav_events=[];self._nav_replay_done=False
         self._nav_index_revision=0
+        self._nav_error=None
         with self.navigation_panel:
             gui.add_markdown('**选地图 → 选当前画面 → 框选目标 → 开始引导。**\n\n'
                 '你用遥控器行走；网页依据新画面给方向，不发送运动指令。没有尺度时显示地图单位。')
@@ -272,7 +273,8 @@ class NavigationControls:
                     self._nav_graph=graph;self._nav_preparing=False
                     self._nav_refresh_junctions()
                     self.nav_exceptions.value=f"自动连接 {len(graph['edges'])} 条；粗导航点 {len(graph['navigation_nodes'])} 个。\n"+('\n'.join(
-                        f"{r['from_frame']} → {r['to_frame']}：{', '.join(r['reasons'])}" for r in graph['exceptions']) or '未检测到断点。')
+                        f"{r['from_frame']} → {r['to_frame']}："+('已由加密原视频观测补足（原帧仍未注册）' if r.get('resolved_by')
+                        else ', '.join(r['reasons'])) for r in graph['exceptions']) or '未检测到断点。')
                     if not start:
                         self.nav_status.value='导航索引已准备好，不需要逐段点确认。';return
                     self._nav_worker=worker;self._nav_task=task;self._nav_source=source
@@ -382,8 +384,9 @@ class NavigationControls:
         if completed:
             if completed['error']:
                 task.state='relocalizing';task.guidance=None;task.plan=None;task.reason='localization_required'
-                self.nav_status.value='定位未完成：'+completed['error']
+                self._nav_error=completed['error']
             else:
+                self._nav_error=None
                 observation=completed['observation']
                 if observation['camera_id']!=self._nav_camera_at_start:
                     self._nav_pause();self.nav_status.value='输入相机与所选安装配置不同，请选择对应相机重新开始。';return
@@ -417,6 +420,12 @@ class NavigationControls:
             return
         prefix='独立录像/照片回放 · ' if task.last and task.last['time_mode']=='offline_replay' else '本地当前画面 · '
         self.nav_status.value=prefix+STATES.get(task.state,task.state)+'\n'+REASONS.get(task.reason,task.reason or '')
+        current=task.current_pose_available(time.monotonic())
+        if current:
+            route_status='路线尚未接入' if task.state=='relocalizing' else STATES.get(task.state,task.state)
+            self.nav_status.value=prefix+'当前位置已定位 · '+route_status+'\n'+REASONS.get(task.reason,task.reason or '')
+        elif task.reason=='localization_required' and self._nav_error:
+            self.nav_status.value=prefix+'定位计算失败：'+self._nav_error+'\n请检查启动日志；这不是已证实的画面质量问题。'
         if self._nav_replay_done:
             self.nav_status.value+='\n没有生成机器人运动。'
         guidance=task.guidance
@@ -427,23 +436,23 @@ class NavigationControls:
             if guidance else '当前无有效方向指令。影子引导不会控制机器狗。')
         if task.plan and task.plan.get('recombined'):
             self.nav_detail.value+=f"\n已重组历史路段：经过 {len(task.plan['junction_transitions'])} 处自动连接，不是原录像整段重放。"
-        current=(task.state not in ('relocalizing','locating','paused','cancelled','failed')
-                 and task.last and task.last.get('pose_status')=='localized'
-                 and (task.last.get('time_mode')!='live_current' or
-                      0<=time.monotonic()-task.last.get('received_monotonic',0)<=task.max_age_s))
         if current:
             self.controller.pose('navigation_current',task.last['T_WC_query'],color=(255,130,0))
         else:
             self.controller.clear('navigation_current');self.nav_current.visible=False
-        if current and task.plan and task.plan['status']=='planned':
+        if current and task.state not in ('relocalizing','blocked') and task.plan and task.plan['status']=='planned':
             self._draw_preview('navigation_route',task.plan['path'],'',(0,190,220))
             self.controller.pose('navigation_goal',task.plan['goal_observation_pose'],color=(45,210,70))
         else:
             self.controller.clear('navigation_route');self.controller.clear('navigation_goal')
         if guidance:
             camera=next((c for c in self.controller.model['cameras'] if c['name']==guidance['reference']),None)
+            if camera is None:
+                camera=task.graph['nodes'].get(guidance['reference'])
             if camera:
                 from .viser_viewer import _read_image
                 self.nav_next.image=_read_image(Path(camera['image_path']));self.nav_next.visible=True
+            else:
+                self.nav_next.visible=False
         else:
             self.nav_next.visible=False
