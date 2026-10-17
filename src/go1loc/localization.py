@@ -8,6 +8,7 @@ import shutil
 import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
+from functools import lru_cache
 from pathlib import Path
 from typing import Any
 
@@ -65,6 +66,108 @@ def _quality(ret: dict[str, Any], total_2d3d: int) -> dict[str, Any]:
     if reproj is not None:
         reproj = float(np.mean(np.asarray(reproj, dtype=float)))
     return {"num_2d3d": total_2d3d, "num_inliers": inliers, "inlier_ratio": ratio, "mean_inlier_reprojection_px": reproj}
+
+
+def _passes_quality(quality, config):
+    return (quality['num_2d3d'] >= config.min_2d3d
+            and quality['num_inliers'] >= config.min_inliers
+            and quality['inlier_ratio'] >= config.min_inlier_ratio)
+
+
+# Additional agreement gates for recovery only. These do not change PnP,
+# navigation entry radii, typical_step, or live-current freshness thresholds.
+REFERENCE_CONSENSUS_POLICY = {
+    'max_rotation_deg': 5.0, 'max_translation_depth_fraction': 0.05,
+    'max_focal_ratio': 1.25, 'min_reciprocal_inlier_fraction': 0.5,
+    'reference_budget': 'top_k', 'partners_per_seed': 1,
+}
+
+
+def _consistent_hypotheses(a, b, config):
+    """Reciprocal image evidence AND pose agreement, not spatial nearest-neighbor.
+
+    Translation is relative to observed scene depth, never an invented metric
+    scale. The pose/focal checks reject planar focal-distance degeneracies that
+    can agree in pixel space despite describing very different camera centers.
+    """
+    ta, tb = (np.asarray(_pose_matrix(c['ret']['cam_from_world'])) for c in (a, b))
+    if not np.isfinite(ta).all() or not np.isfinite(tb).all():
+        return False
+    angle = np.degrees(np.arccos(np.clip((np.trace(ta[:3,:3].T @ tb[:3,:3])-1)/2, -1, 1)))
+    if angle > REFERENCE_CONSENSUS_POLICY['max_rotation_deg']:
+        return False
+    # All hypotheses start from the same camera model and supplied intrinsics.
+    # fx (or the single focal parameter) must remain mutually compatible too.
+    focals = [float(c['camera'].params[0]) for c in (a, b)]
+    if min(focals) <= 0 or max(focals)/min(focals) > REFERENCE_CONSENSUS_POLICY['max_focal_ratio']:
+        return False
+    for observer, source, transform, source_transform in ((a,b,ta,tb), (b,a,tb,ta)):
+        # Count a query feature once, even if it has several map-point hypotheses.
+        unique = {}
+        for row in sorted(source['rows'], key=lambda r: r.get('reprojection_px') or 0):
+            if (row['pnp_inlier'] and row['positive_depth'] and row['reprojection_px'] is not None
+                    and row['reprojection_px'] <= config.max_reprojection_px):
+                unique.setdefault(row['query_keypoint_index'], row)
+        rows = list(unique.values())
+        if len(rows) < config.min_inliers:
+            return False
+        xyz = np.asarray([r['xyz'] for r in rows])
+        source_depth = ((xyz-source_transform[:3,3]) @ source_transform[:3,:3])[:,2]
+        depth = float(np.median(source_depth))
+        if depth <= 0 or np.linalg.norm(ta[:3,3]-tb[:3,3]) > depth*REFERENCE_CONSENSUS_POLICY['max_translation_depth_fraction']:
+            return False
+        camera_xyz = (xyz-transform[:3,3]) @ transform[:3,:3]
+        pixels = np.asarray(observer['camera'].img_from_cam(camera_xyz))
+        errors = np.linalg.norm(pixels-np.asarray([r['uv_colmap'] for r in rows]), axis=1)
+        valid = np.isfinite(errors) & (camera_xyz[:,2] > 0) & (errors <= config.max_reprojection_px)
+        if valid.sum() < config.min_inliers or valid.mean() < REFERENCE_CONSENSUS_POLICY['min_reciprocal_inlier_fraction']:
+            return False
+    return True
+
+
+def _reference_consensus_candidates(clusters, evidence, solve, config):
+    """Bounded recovery from query-mismatched transitive covisibility clusters.
+
+    Select reference hypotheses, not individual RANSAC inliers. Re-solve each
+    compatible pair using ALL of its original correspondences and the unchanged
+    quality gates. A single good reference is never sufficient for recovery.
+    """
+    support = {}
+    for component, cluster in enumerate(clusters):
+        if len(cluster) < 2:
+            continue
+        for row in evidence[component]['rows']:
+            for ref in row['references']:
+                support.setdefault((component, ref['image_id']), set()).add(row['query_keypoint_index'])
+    ranked = sorted(support, key=lambda key: (-len(support[key]), key))[:max(0, config.top_k)]
+    seeds = []
+    for component, image_id in ranked:
+        if len(support[(component,image_id)]) < config.min_2d3d:
+            continue
+        candidate = solve([image_id], 'reference_hypothesis')
+        if candidate and _passes_quality(candidate['quality'], config):
+            seeds.append((component, image_id, candidate))
+    seeds.sort(key=lambda s: (-s[2]['quality']['num_inliers'], s[0], s[1]))
+    pairs, seen = [], set()
+    for component, image_id, seed in seeds:
+        partner = next((s for s in seeds if s[0] == component and s[1] != image_id
+                        and _consistent_hypotheses(seed, s[2], config)), None)
+        if partner is None:
+            continue
+        ids = tuple(sorted((image_id, partner[1])))
+        if ids in seen:
+            continue
+        seen.add(ids)
+        joint = solve(list(ids), 'query_reference_consensus')
+        if not joint:
+            continue
+        joint['quality']['covisibility_cluster_index'] = component
+        joint['quality']['consensus_seed_clusters'] = [seed['cluster_index'], partner[2]['cluster_index']]
+        if (_passes_quality(joint['quality'], config)
+                and _consistent_hypotheses(joint, seed, config)
+                and _consistent_hypotheses(joint, partner[2], config)):
+            pairs.append(joint)
+    return sorted(pairs, key=lambda c: (-c['quality']['num_inliers'], c['cluster_index']))
 
 
 def _save_result(output_dir: Path, result: LocalizationResult) -> LocalizationResult:
@@ -212,7 +315,14 @@ def localize_photo(query_path: Path, map_dir: Path, output_dir: Path, config: Lo
     all_evidence = []
     started = time.perf_counter()
     localizer = localize_sfm.QueryLocalizer(model, pose_options)
-    for index, cluster in enumerate(clusters):
+    from hloc.utils.io import get_matches
+
+    @lru_cache(maxsize=None)
+    def read_matches(name):
+        return get_matches(query_matches, query_name, name)
+
+    def solve(cluster, strategy='covisibility_component'):
+        index = len(all_evidence)
         # Each estimator may refine its camera. Preserve the camera used by each pose.
         cluster_camera = pycolmap.Camera(camera.todict())
         ret, log = localize_sfm.pose_from_cluster(
@@ -225,25 +335,36 @@ def localize_photo(query_path: Path, map_dir: Path, output_dir: Path, config: Lo
         )
         if not cluster_camera.verify_params() or not np.isfinite(cluster_camera.params).all():
             raise PipelineInputError('invalid_estimated_query_camera_parameters')
-        from hloc.utils.io import get_matches
-        rows = export_rows(model, log, ret, cluster_camera,
-                           lambda name: get_matches(query_matches, query_name, name))
+        rows = export_rows(model, log, ret, cluster_camera, read_matches)
         raw_uv = original_coordinates([r['uv'] for r in rows], rectification)
         for row, uv in zip(rows, raw_uv):
             row['uv_original'] = uv.tolist()
         all_evidence.append({'cluster_index': index, 'reference_image_ids': [int(i) for i in cluster],
+                             'reference_strategy': strategy,
+                             'T_WC_candidate': _pose_matrix(ret['cam_from_world']) if ret is not None else None,
                              'num_matches': int(log['num_matches']), 'rows': rows,
                              'camera': {'model': cluster_camera.model.name, 'width': cluster_camera.width,
                                         'height': cluster_camera.height, 'params': cluster_camera.params.tolist()}})
         if ret is None:
-            continue
+            return None
         quality = _quality(ret, len(log.get("points3D_ids", [])))
         quality.update(row_diagnostics(rows, camera.width, camera.height))
         quality.update({"cluster_index": index, "retrieved_reference_count": len(cluster), "query_intrinsics": query_intrinsics_status})
         quality['query_camera'] = all_evidence[-1]['camera']
+        quality['reference_strategy'] = strategy
         quality['acceptance_thresholds'] = {'min_2d3d': config.min_2d3d, 'min_inliers': config.min_inliers,
             'min_inlier_ratio': config.min_inlier_ratio, 'max_reprojection_px': config.max_reprojection_px}
-        candidates.append({"ret": ret, "log": log, "quality": quality, "cluster_index": index})
+        return {"ret": ret, "log": log, "quality": quality, "cluster_index": index,
+                'camera': cluster_camera, 'rows': rows}
+
+    for cluster in clusters:
+        candidate = solve(cluster)
+        if candidate:
+            candidates.append(candidate)
+    recovery = []
+    if not any(_passes_quality(c['quality'], config) for c in candidates):
+        recovery = _reference_consensus_candidates(clusters, all_evidence, solve, config)
+        geometry['reference_consensus_policy'] = {**REFERENCE_CONSENSUS_POLICY, 'top_k': config.top_k}
     def finish(result, selected=None):
         result.map_hash = manifest['manifest_sha256']
         result.capture_time = config.capture_time
@@ -269,6 +390,17 @@ def localize_photo(query_path: Path, map_dir: Path, output_dir: Path, config: Lo
         evidence['evidence_sha256'] = digest_json(evidence)
         write_json(output_dir/'query_evidence.json', evidence)
         return _save_result(output_dir, result)
+    if recovery:
+        best = recovery[0]
+        alternatives = [c for c in recovery[1:]
+                        if c['quality']['num_inliers'] >= 0.9*best['quality']['num_inliers']
+                        and (c['quality']['covisibility_cluster_index'] != best['quality']['covisibility_cluster_index']
+                             or not _consistent_hypotheses(best, c, config))]
+        if alternatives:
+            result = LocalizationResult.failure(query_id=query_name, map_id=map_id, reason='ambiguous_reference_consensus')
+            result.quality = {'best': best['quality'], 'alternatives': [c['quality'] for c in alternatives]}
+            return finish(result, best['cluster_index'])
+        candidates = [best]
     if not candidates:
         result = LocalizationResult.failure(query_id=query_name, map_id=map_id, reason="insufficient_pnp_evidence")
         result.quality = {"retrieved_reference_count": len(db_ids), "candidate_clusters": len(clusters)}
@@ -285,7 +417,7 @@ def localize_photo(query_path: Path, map_dir: Path, output_dir: Path, config: Lo
         result.quality = {"best": quality, "alternatives": [c["quality"] for c in candidates[1:]]}
         return finish(result, best['cluster_index'])
     component_id = None
-    best_image_ids = {int(image_id) for image_id in clusters[best["cluster_index"]]}
+    best_image_ids = set(all_evidence[best['cluster_index']]['reference_image_ids'])
     for component in manifest.get("components", []):
         component_image_ids = {int(image_id) for image_id in component.get("image_ids", [])}
         if best_image_ids & component_image_ids:

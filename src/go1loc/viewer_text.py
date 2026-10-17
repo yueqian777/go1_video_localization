@@ -32,6 +32,7 @@ ERRORS = {
     'reviewer': '请填写审核人，并记录你实际查看的素材和连续性判断依据。',
     'evidence_note': '请填写审核依据：核对了哪段原视频、是否存在跳切或中断。',
     'insufficient_pnp_quality': '照片定位证据不足，未接受位姿。请换用更清晰、有重叠视野的独立照片。',
+    'ambiguous_reference_consensus': '多个参考图组给出互相冲突的位置，暂不采用位姿。请提供新的重叠视角，不会任取一个结果。',
     'FileNotFoundError': '未找到输入文件。请检查路径是否存在，或使用选择照片按钮。',
     'IsADirectoryError': '需要文件，但当前路径是文件夹或为空。请选择对应文件。',
     'PermissionError': '文件暂时无法访问。请检查权限或文件是否被其他程序占用。',

@@ -526,6 +526,8 @@ class NavigationControls:
                 and diagnostic['pose_status']!='localized'):
             failure=diagnostic.get('failure_reason') or diagnostic['pose_status']
             detail='位姿质量不足' if failure=='insufficient_pnp_quality' else '未取得合格位姿：'+str(failure)
+            if failure=='ambiguous_reference_consensus':
+                detail='多个参考图组给出互相冲突的位置，暂不采用位姿'
             slow=diagnostic['received_to_evaluation_s']>task.max_age_s
             self.nav_status.value=prefix+'本次照片定位失败：'+detail+('；计算结果同时超时。' if slow else '。')
             self.nav_status.value+='\n这是已收到图像的计算结果，不是已证实的相机断流；未生成方向。'

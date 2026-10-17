@@ -144,6 +144,24 @@ class NavigationUITests(unittest.TestCase):
         self.app._refresh_overview()
         self.assertIn('自动路线关联',self.app.overview.content)
 
+    def test_reference_consensus_ambiguity_explains_no_pose_or_direction(self):
+        from test_navigation import setup_graph, observation
+        from go1loc.viewer_text import query_failure_notice
+        graph=setup_graph();self.app._nav_task=NavigationTask(graph,[],up=[1,0,0])
+        self.app._nav_worker=Mock();self.app._nav_source=None
+        self.app._nav_run=self.app.sidecar/'ambiguous-pose';self.app._nav_camera_at_start='camera6'
+        self.app.target_result={'supporting_point3D_ids':[]}
+        obs=observation(graph);obs.update(pose_status='ambiguous',T_WC_query=None,image_path='test.png',
+            failure_reason='ambiguous_reference_consensus',quality={})
+        self.app._nav_worker.take.return_value=dict(error=None,observation=obs,latency_s=.1,directory='query')
+        with patch('go1loc.navigation_ui.time.monotonic',return_value=1.1), patch(
+                'go1loc.viser_viewer._read_image',return_value=f.np.zeros((2,2,3),dtype=f.np.uint8)):
+            self.app._nav_tick()
+        self.assertIn('多个参考图组',self.app.nav_status.value)
+        self.assertIn('多个参考图组',query_failure_notice(obs))
+        self.assertIsNone(self.app._nav_task.guidance)
+        self.assertNotIn('navigation_current',self.app.controller.groups)
+
     def test_target_invalidation_stops_worker_and_removes_all_guidance(self):
         worker=Mock();self.app._nav_worker=worker;self.app._nav_task=Mock()
         generation=self.app._nav_generation
