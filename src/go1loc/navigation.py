@@ -121,7 +121,60 @@ def build_navigation_index(manifest, references, frames, declaration):
     return graph
 
 
-def associate_route(graph, observation, previous=None):
+def _same_dwell_chain(graph, first, second):
+    """Collapse ambiguity across a short recorded stop, NOT across a junction.
+
+    Only an unbranched, enabled, same-traversal chain of observation-only edges
+    may intervene. No graph mutation, new connection, or route shortcut occurs.
+    """
+    kind='automatic_recorded_traversal'
+    if any(e.get('provenance',{}).get('kind') != kind for e in (first,second)):
+        return False
+    traversal=first['provenance'].get('traversal_id')
+    if traversal is None or second['provenance'].get('traversal_id') != traversal:
+        return False
+    for a,b in ((first,second),(second,first)):
+        node=a['to']; seen=set(); distance=0.
+        while node != b['from'] and node not in seen and len(seen)<64:
+            seen.add(node)
+            outgoing=[e for e in graph['edges'].values() if e['enabled'] and e['from']==node
+                      and e.get('provenance',{}).get('kind') not in
+                      ('declared_reversible_traversal','automatic_repeat_place')]
+            if len(outgoing)!=1:
+                break
+            edge=outgoing[0];provenance=edge.get('provenance',{})
+            if (not edge.get('observation_only') or provenance.get('kind') != kind
+                    or provenance.get('traversal_id') != traversal):
+                break
+            distance+=edge['length']
+            if distance>graph['typical_step']:
+                break
+            node=edge['to']
+        else:
+            if node==b['from']:
+                return True
+    return False
+
+
+def _tracking_context(graph, observation, previous, max_gap):
+    if not previous or previous.get('status')!='associated' or previous.get('edge_id') not in graph['edges']:
+        return None
+    old=previous.get('tracking_observation') or {}
+    keys=('map_hash','component_id','session_id','camera_id','time_mode')
+    if any(observation.get(k) is None or observation.get(k)!=old.get(k) for k in keys):
+        return None
+    clock='received_monotonic' if observation['time_mode']=='live_current' else 'image_time_s'
+    try:
+        if (observation['sequence']<=old['sequence'] or observation['query_sha256']==old['query_sha256']
+                or not 0<float(observation[clock])-float(old[clock])<=max_gap
+                or np.linalg.norm(position(observation['T_WC_query'])-np.asarray(old['position']))>graph['typical_step']):
+            return None
+    except (KeyError,TypeError,ValueError):
+        return None
+    return graph['edges'][previous['edge_id']]
+
+
+def associate_route(graph, observation, previous=None, *, max_tracking_gap_s=3.):
     """Associate a measured pose, not an unconditional nearest-node snap."""
     if (not observation.get('evidence_verified') or observation.get('pose_status') != 'localized'
             or any(observation.get(k) != graph[k] for k in ('map_hash','component_id'))):
@@ -130,7 +183,8 @@ def associate_route(graph, observation, previous=None):
     if not refs:
         return {'status':'reference_evidence_missing', 'candidates':[]}
     pose = _rigid(observation['T_WC_query']); p = pose[:3,3]
-    step = graph['typical_step']; candidates = []
+    step = graph['typical_step']; candidates = []; rejected=[]
+    old=_tracking_context(graph,observation,previous,max_tracking_gap_s)
     for eid, edge in graph['edges'].items():
         if not edge['enabled'] or edge.get('provenance',{}).get('kind')=='automatic_repeat_place':
             continue
@@ -141,28 +195,52 @@ def associate_route(graph, observation, previous=None):
         support = sum(n in refs or len(refs.intersection(
             graph['nodes'][n].get('localization_references',[]))) >= 2 for n in (edge['from'],edge['to']))
         heading = max(float(pose[:3,2] @ _rigid(graph['nodes'][n]['T_MC'])[:3,2]) for n in (edge['from'],edge['to']))
-        if d > 2*step or not support or heading < -.5:
-            continue
+        # Entry remains 2 sampling intervals. A previously acquired track has
+        # a half-interval exit deadband, only with BOTH endpoint supports,
+        # compatible heading and a newer same-source pose moving <= one interval.
+        # This is a camera-route association, never a traversability certificate.
+        tracking=bool(old and support==2 and heading>=.5 and d<=2.5*step
+                      and np.linalg.norm(q-np.asarray(previous['projection']))<=step
+                      and (eid==previous['edge_id'] or edge['from']==old['to']
+                           or _same_dwell_chain(graph,old,edge)))
+        limit=(2.5 if tracking else 2.)*step
         score = d/step + .2*(1-heading) + .15*(2-support)
-        if previous and previous.get('status') == 'associated':
-            old = graph['edges'][previous['edge_id']]
+        if old:
             if eid == previous['edge_id'] or edge['from'] == old['to']:
                 score -= .15
-        candidates.append(dict(edge_id=eid, fraction=t, projection=q.tolist(), distance=d,
-                               score=score, reference_support=support, heading_agreement=heading))
+        candidate=dict(edge_id=eid, fraction=t, projection=q.tolist(), distance=d,
+                       score=score, reference_support=support, heading_agreement=heading,
+                       distance_limit=limit, entry_limit=2*step,
+                       association_mode='bounded_tracking' if d>2*step and tracking else 'core_entry')
+        reasons=[]
+        if d>limit: reasons.append('distance')
+        if not support: reasons.append('reference_support')
+        if heading<-.5: reasons.append('heading')
+        if reasons:
+            rejected.append({**candidate,'rejection_reasons':reasons});continue
+        candidates.append(candidate)
     candidates.sort(key=lambda x:x['score'])
     if not candidates:
-        return {'status':'off_route', 'candidates':[]}
+        return {'status':'off_route', 'candidates':[],
+                'rejected_candidates':sorted(rejected,key=lambda c:c['distance'])[:3]}
     best = candidates[0]
     for other in candidates[1:]:
+        if other['score']-best['score'] >= .2:
+            break
         e1, e2 = (graph['edges'][c['edge_id']] for c in (best,other))
         adjacent = bool({e1['from'],e1['to']} & {e2['from'],e2['to']})
         if not adjacent:
+            adjacent=_same_dwell_chain(graph,e1,e2)
+        if not adjacent:
             from .junctions import edges_meet_at_junction
             adjacent=edges_meet_at_junction(graph,e1,e2,p)
-        if not adjacent and other['score']-best['score'] < .2:
+        if not adjacent:
             return {'status':'ambiguous_branch', 'candidates':candidates[:3]}
+    tracking_observation={k:observation.get(k) for k in ('map_hash','component_id','session_id',
+        'camera_id','time_mode','sequence','query_sha256','received_monotonic','image_time_s')}
+    tracking_observation['position']=p.tolist()
     return {**best, 'status':'associated', 'candidates':candidates[:3],
+            'tracking_observation':tracking_observation,
             'local_approach':'unverified_camera_route_association_only'}
 
 
@@ -214,15 +292,21 @@ class NavigationTask:
         self.best_remaining = math.inf; self.progress_time = None
         self.arrival_sequence = None; self.reason = None
         self.stable_association=None; self.recovery_candidate=None
+        self.progress_notice=None
+
+    def clear_tracking(self):
+        self.association=None; self.stable_association=None; self.recovery_candidate=None
 
     def pause(self):
         self.state = 'paused'; self.guidance = None
+        self.clear_tracking()
 
     def cancel(self):
         self.state = 'cancelled'; self.guidance = None; self.plan = None
 
     def resume(self):
         self.state = 'locating'; self.guidance = None; self.progress_time = None
+        self.clear_tracking()
 
     def tick(self, now):
         if self.state in ('paused','cancelled','failed','target_confirmed'):
@@ -230,6 +314,7 @@ class NavigationTask:
         if self.last and self.last['time_mode'] == 'live_current' and now-self.last['received_monotonic'] > self.max_age_s:
             self.state = 'relocalizing'; self.guidance = None; self.reason = 'frame_stale_or_disconnected'
             self.plan = None
+            self.clear_tracking()
 
     def current_pose_available(self, now):
         """A verified fresh camera pose is not contingent on finding a route."""
@@ -261,15 +346,19 @@ class NavigationTask:
             return
         if self.last:
             if any(observation.get(k) != self.last.get(k) for k in ('session_id','camera_id','time_mode')):
+                self.clear_tracking()
                 self.state = 'relocalizing'; self.guidance = None; self.plan = None; self.reason = 'source_changed_restart_required'; return
             if observation['sequence'] <= self.last['sequence']:
                 return
         if observation['time_mode'] == 'live_current' and not 0 <= now-observation['received_monotonic'] <= self.max_age_s:
+            self.clear_tracking()
             self.state='relocalizing'; self.guidance=None; self.plan=None; self.reason='stale_result'; return
         if self.last and observation['query_sha256'] == self.last['query_sha256']:
+            self.clear_tracking()
             self.state='relocalizing'; self.guidance=None; self.plan=None; self.reason='unchanged_pixels_static_or_frozen'; return
         self.last = deepcopy(observation)
-        a = associate_route(self.graph, observation, self.association)
+        self.progress_notice=None
+        a = associate_route(self.graph, observation, self.association,max_tracking_gap_s=self.max_age_s)
         self.association = a
         if a['status'] != 'associated':
             self.state='relocalizing'; self.guidance=None; self.plan=None; self.reason=a['status']; return
@@ -295,9 +384,9 @@ class NavigationTask:
         if remaining < self.best_remaining-step*.15 or self.progress_time is None:
             self.best_remaining=remaining; self.progress_time=image_time
         elif image_time-self.progress_time > self.no_progress_s:
-            self.closed.add(a['edge_id'])
-            self.plan=plan_guidance(self.graph,a,self.goals,self.closed)
-            self.state='blocked'; self.guidance=None; self.reason='no_observed_progress'; return
+            # Shadow mode sends no movement. No measured progress is NOT
+            # evidence of an obstacle: only explicit close_edge may close it.
+            self.progress_notice='stationary_or_no_observed_progress'
         goal_distance = float(np.linalg.norm(position(observation['T_WC_query'])-position(self.plan['goal_observation_pose'])))
         # A region spans one measured reference sampling interval, not a
         # fabricated metric radius or an exact historic camera pixel pose.
@@ -350,6 +439,7 @@ class NavigationTask:
 
     def snapshot(self):
         return dict(state=self.state, reason=self.reason, guidance=self.guidance, plan=self.plan,
+            progress_notice=self.progress_notice,
             association=self.association, closed_edges=sorted(self.closed),
             sequence=self.last.get('sequence') if self.last else None,
             execution_permitted=False, mode='shadow_guidance')

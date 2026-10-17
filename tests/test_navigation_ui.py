@@ -23,9 +23,41 @@ class NavigationUITests(unittest.TestCase):
         self.assertIn('navigation_current',self.app.controller.groups)
         self.assertNotIn('navigation_route',self.app.controller.groups)
         self.assertIn('当前位置已定位',self.app.nav_status.value)
+        self.assertIn('最近候选',self.app.nav_detail.value)
         with patch('go1loc.navigation_ui.time.monotonic',return_value=10):
             self.app._nav_render()
         self.assertNotIn('navigation_current',self.app.controller.groups)
+
+    def test_stationary_notice_and_association_limits_are_visible_without_closing(self):
+        from test_navigation import setup_graph, observation
+        g=setup_graph();task=NavigationTask(g,[dict(node_id='m.png',quality=1.)],up=[1,0,0])
+        for node in g['nodes'].values():node['image_path']='synthetic-test.png'
+        self.app._nav_task=task
+        for seq in (1,30):task.observe(observation(g,seq=seq),now=seq)
+        with patch('go1loc.viser_viewer._read_image',return_value=f.np.zeros((2,2,3),dtype=f.np.uint8)):
+            self.app._nav_render()
+        self.assertIn('未自动封路',self.app.nav_detail.value)
+        self.assertIn('正常距离范围',self.app.nav_detail.value)
+        self.assertIn('门限',self.app.nav_detail.value)
+        self.assertFalse(task.closed)
+
+    def test_rejected_completion_keeps_its_own_capture_clock_for_diagnostics(self):
+        from test_navigation import setup_graph, observation
+        g=setup_graph();task=NavigationTask(g,[],up=[1,0,0])
+        self.app._nav_task=task;self.app._nav_worker=Mock();self.app._nav_source=None
+        self.app._nav_run=self.app.sidecar/'clock-log';self.app._nav_camera_at_start='camera6'
+        self.app.target_result={'supporting_point3D_ids':[]}
+        o=observation(g);o.update(time_mode='live_current',image_path='local-test.png')
+        self.app._nav_worker.take.return_value=dict(error=None,observation=o,latency_s=5.,directory='query')
+        with patch('go1loc.navigation_ui.time.monotonic',return_value=6.), patch(
+                'go1loc.viser_viewer._read_image',return_value=f.np.zeros((2,2,3),dtype=f.np.uint8)):
+            self.app._nav_tick()
+        event=self.app._nav_events[-1]
+        self.assertEqual(event['reason'],'stale_result')
+        self.assertIsNone(event['sequence'])
+        self.assertEqual(event['observation_metadata']['sequence'],1)
+        self.assertEqual(event['observation_metadata']['received_monotonic'],1.)
+        self.assertEqual(event['evaluated_monotonic'],6.)
 
     def test_model_error_is_not_replaced_by_bad_photo_advice(self):
         from test_navigation import setup_graph

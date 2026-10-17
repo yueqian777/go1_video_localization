@@ -376,6 +376,7 @@ class NavigationControls:
                     raise ValueError('采集会话改变，请重新开始引导。')
             except ValueError:
                 worker.reset();task.state='relocalizing';task.guidance=None;task.plan=None
+                task.clear_tracking()
                 task.reason='frame_stale_or_disconnected'
                 self.nav_current.visible=False
                 self._nav_render()
@@ -384,6 +385,7 @@ class NavigationControls:
         if completed:
             if completed['error']:
                 task.state='relocalizing';task.guidance=None;task.plan=None;task.reason='localization_required'
+                task.clear_tracking()
                 self._nav_error=completed['error']
             else:
                 self._nav_error=None
@@ -395,7 +397,13 @@ class NavigationControls:
                 from .viser_viewer import _read_image
                 self.nav_current.image=_read_image(Path(observation['image_path']));self.nav_current.visible=True
                 self._nav_latency=completed['latency_s']
+            # Retain source clocks even for stale/rejected results. A task's last
+            # accepted sequence alone cannot reconstruct inference freshness.
+            metadata=completed.get('observation') or completed.get('metadata') or {}
             self._nav_events.append({**task.snapshot(),'at':utc_now(),'latency_s':completed['latency_s'],
+                'observation_metadata':{k:metadata.get(k) for k in ('sequence','session_id','camera_id',
+                    'time_mode','image_time_s','received_monotonic','runtime_at','time_source','sensor_capture_time')},
+                'evaluated_monotonic':time.monotonic(),
                 'query_directory':completed.get('directory'),'error':completed['error']})
             atomic_json(self._nav_run/'guidance_log.json',self._nav_events[-10000:])
         task.tick(time.monotonic())
@@ -411,6 +419,7 @@ class NavigationControls:
                         task.pause();task.reason='replay_ended_without_fabricated_arrival'
                 except Exception as exc:
                     task.state='relocalizing';task.guidance=None;task.reason='frame_stale_or_disconnected'
+                    task.plan=None;task.clear_tracking()
                     self.nav_status.value='采集不可用：'+str(exc)
         self._nav_render()
 
@@ -436,6 +445,19 @@ class NavigationControls:
             if guidance else '当前无有效方向指令。影子引导不会控制机器狗。')
         if task.plan and task.plan.get('recombined'):
             self.nav_detail.value+=f"\n已重组历史路段：经过 {len(task.plan['junction_transitions'])} 处自动连接，不是原录像整段重放。"
+        if current and task.progress_notice:
+            self.nav_detail.value+='\n未观察到前进（可能正在静止测试）；未自动封路。确认障碍后可手动封路。'
+        association=task.association or {}
+        if current and association.get('status')=='associated':
+            self.nav_detail.value+=('\n接入：'+('有界跟踪缓冲' if association.get('association_mode')=='bounded_tracking'
+                else '正常距离范围')+f" · {association['edge_id']} · 距离 {association['distance']:.3f} / "
+                f"门限 {association['distance_limit']:.3f} {task.graph['units']}")
+        elif current and association.get('rejected_candidates'):
+            nearest=association['rejected_candidates'][0]
+            reasons={'distance':'超出距离门限','reference_support':'缺少端点参考证据','heading':'朝向不符'}
+            self.nav_detail.value+=(f"\n最近候选 {nearest['edge_id']}：距离 {nearest['distance']:.3f} / "
+                f"门限 {nearest['distance_limit']:.3f} {task.graph['units']}；"+
+                '、'.join(reasons[r] for r in nearest['rejection_reasons']))
         if current:
             self.controller.pose('navigation_current',task.last['T_WC_query'],color=(255,130,0))
         else:
