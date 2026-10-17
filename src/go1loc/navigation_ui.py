@@ -133,7 +133,7 @@ class NavigationControls:
             self.nav_status.value='正在读取已有相机画面，不会启动采集或运动…'
             def fetch():
                 try:
-                    item=LocalCaptureReader(output).next()
+                    item=self._nav_live_reader(output).next()
                     if not item:
                         raise ValueError('尚无新画面，请检查本地采集页后重试。')
                     path,metadata=item
@@ -161,6 +161,10 @@ class NavigationControls:
         self.photo.value=str(path);self._query_selected=True;self.query_path.value=''
         self.nav_status.value='已取得目标照片，请打开原图框选并计算。'
         self._message('当前原图已设为待框选目标。请打开原图框选；研究模式的独立照片检查保持不变。')
+
+    def _nav_live_reader(self, output):
+        factory=getattr(self,'live_reader_factory',None) or LocalCaptureReader
+        return factory(output)
 
     def _nav_map_loaded(self):
         self._nav_index_revision+=1
@@ -251,7 +255,7 @@ class NavigationControls:
                             map_image_hashes=backend.manifest['reference_image_sha256'].values(),
                             map_pixel_hashes=reference_pixel_hashes(backend.manifest))
                     elif mode=='已开启的本地相机':
-                        source=LocalCaptureReader(run/'frames')
+                        source=self._nav_live_reader(run/'frames')
                     else:
                         source=None
                         if not Path(photo).is_file():
@@ -361,10 +365,23 @@ class NavigationControls:
         worker,task=self._nav_worker,self._nav_task
         if worker is None or task is None:
             return
+        if hasattr(self._nav_source,'check_available') and task.state not in ('paused','cancelled'):
+            try:
+                frame=self._nav_source.check_available()
+                if task.last and task.last.get('session_id') and (
+                        task.last['session_id']!=frame.header['session_id'] or
+                        task.last['camera_id']!='camera'+str(frame.header['camera_id'])):
+                    raise ValueError('采集会话改变，请重新开始引导。')
+            except ValueError:
+                worker.reset();task.state='relocalizing';task.guidance=None;task.plan=None
+                task.reason='frame_stale_or_disconnected'
+                self.nav_current.visible=False
+                self._nav_render()
+                return
         completed=worker.take()
         if completed:
             if completed['error']:
-                task.state='relocalizing';task.guidance=None;task.reason='localization_required'
+                task.state='relocalizing';task.guidance=None;task.plan=None;task.reason='localization_required'
                 self.nav_status.value='定位未完成：'+completed['error']
             else:
                 observation=completed['observation']
@@ -380,7 +397,7 @@ class NavigationControls:
             atomic_json(self._nav_run/'guidance_log.json',self._nav_events[-10000:])
         task.tick(time.monotonic())
         if self._nav_source and task.state not in ('paused','cancelled','target_confirmed'):
-            live=isinstance(self._nav_source,LocalCaptureReader)
+            live=isinstance(self._nav_source,LocalCaptureReader) or getattr(self._nav_source,'is_live',False)
             if live or (not worker.busy and worker.pending is None):
                 try:
                     item=self._nav_source.next()
@@ -410,9 +427,15 @@ class NavigationControls:
             if guidance else '当前无有效方向指令。影子引导不会控制机器狗。')
         if task.plan and task.plan.get('recombined'):
             self.nav_detail.value+=f"\n已重组历史路段：经过 {len(task.plan['junction_transitions'])} 处自动连接，不是原录像整段重放。"
-        if task.last and task.last.get('pose_status')=='localized':
+        current=(task.state not in ('relocalizing','locating','paused','cancelled','failed')
+                 and task.last and task.last.get('pose_status')=='localized'
+                 and (task.last.get('time_mode')!='live_current' or
+                      0<=time.monotonic()-task.last.get('received_monotonic',0)<=task.max_age_s))
+        if current:
             self.controller.pose('navigation_current',task.last['T_WC_query'],color=(255,130,0))
-        if task.plan and task.plan['status']=='planned':
+        else:
+            self.controller.clear('navigation_current');self.nav_current.visible=False
+        if current and task.plan and task.plan['status']=='planned':
             self._draw_preview('navigation_route',task.plan['path'],'',(0,190,220))
             self.controller.pose('navigation_goal',task.plan['goal_observation_pose'],color=(45,210,70))
         else:

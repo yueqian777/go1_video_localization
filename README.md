@@ -4,6 +4,9 @@
 
 ## 当前实现
 
+- **统一工作台**：相机预览/录制与三维建图/定位共用一个网页入口。完整录像可直接送入建图，实时定位直接订阅同一采集服务的源帧，不重复开启 SSH。默认不连接、不录制、不控制运动。见[统一工作台说明](docs/UNIFIED_WORKBENCH_20261017_zh.md)。
+- `go1loc capture-ui`：独立单路相机预览和手动 PNG 录像；仅在勾选确认并点击连接后使用 SSH 只读代理。默认不连接、不部署、不发运动命令。`--synthetic` 可离线演练。
+- `go1loc export-capture` / `prepare-capture`：核验源 PNG，导出经过像素回读检查的 VFR FFV1，或直接生成已有 `build-map` 使用的有序帧清单。见[相机采集手册](docs/GO1_NETWORK_CAPTURE_zh.md)与[离线验证和实机待验收清单](docs/GO1_NETWORK_CAPTURE_VALIDATION_20261015_zh.md)。
 - `go1loc prepare-video`：对真实视频做 SHA-256、ffprobe、基于真实 PTS 的有界解码、模糊/过曝/疑似冗余筛选；有认证标定时保存非线性去畸变映射和有效区域。
 - `go1loc build-map`：依赖安装后调用固定版本 hloc + SuperPoint + LightGlue + pycolmap 建立真实稀疏地图。
 - `go1loc build-map --max-keypoints N`：为显存受限设备设置 SuperPoint 特征点上限；默认仍为 4096，公开样例实测使用 2048。

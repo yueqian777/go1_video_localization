@@ -1,0 +1,8 @@
+{
+  "workbench": true,
+  "connection_config": "configs/capture_go1.example.json",
+  "output": "data/captures",
+  "port": 8772,
+  "viewer_config": null,
+  "workspace_dir": "results/workbench"
+}

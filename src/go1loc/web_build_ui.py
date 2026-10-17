@@ -46,7 +46,8 @@ class WebBuildControls:
         self._web_last_follow = True
         self._web_applied_job = None
         gui = self.server.gui
-        with gui.add_folder('新建地图：选视频 → 开始 → 看进度', expand_by_default=False):
+        self.web_panel = gui.add_folder('新建地图：选视频 → 开始 → 看进度', expand_by_default=False)
+        with self.web_panel:
             gui.add_markdown('**不用打开 PowerShell。** 可直接选择录制台保存的原始记录，或上传 MP4 / MKV。检查首帧后开始。每次自动新建目录，旧地图和原视频不改动。\n\n'
                              '仅本机处理、不上传云端、不连接机器狗。建议先试 30 秒；网页单文件 ≤512 MiB、单次 ≤240 帧。')
             self.web_capture_choice = gui.add_dropdown('① 录制台已保存记录（推荐，无需导出视频）', ['（暂无完整记录）'])
@@ -121,7 +122,12 @@ class WebBuildControls:
         capture_id = self._web_capture_options.get(self.web_capture_choice.value)
         if capture_id is None:
             raise ValueError('请选择已完成的录像记录；单张照片和未结束录像不用于建图。')
+        self.select_capture_for_build(capture_id)
+
+    def select_capture_for_build(self, capture_id):
+        """Shared recording-to-map handoff; selection never starts reconstruction."""
         self.web_build.select_capture(capture_id)
+        self.web_panel.expand_by_default = True
         self._web_unconfirm()
         self.web_native.visible = False
         self.web_start_button.disabled = True

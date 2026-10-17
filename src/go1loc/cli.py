@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import subprocess
 from pathlib import Path
 
 from .doctor import collect_doctor, write_doctor
@@ -23,6 +24,20 @@ def _path(value: str) -> Path:
 def main(argv=None) -> int:
     parser = argparse.ArgumentParser(prog="go1loc")
     sub = parser.add_subparsers(dest="command", required=True)
+    capture = sub.add_parser('capture-ui', help='Manual loopback camera UI; no automatic robot connection')
+    capture.add_argument('--config', default='configs/capture_go1.example.json')
+    capture.add_argument('--output', default='data/captures')
+    capture.add_argument('--port', type=int, default=8767)
+    capture.add_argument('--synthetic', action='store_true', help='Explicit offline synthetic source, not Go1 images')
+    cap_import = sub.add_parser('prepare-capture', help='Verify source PNG sequence and prepare ordered map frames')
+    cap_import.add_argument('session')
+    cap_import.add_argument('--output', required=True)
+    cap_import.add_argument('--config')
+    cap_import.add_argument('--calibration')
+    cap_import.add_argument('--allow-interrupted', action='store_true')
+    cap_export = sub.add_parser('export-capture', help='Export and verify lossless VFR FFV1 MKV')
+    cap_export.add_argument('session')
+    cap_export.add_argument('--allow-interrupted', action='store_true')
     doctor = sub.add_parser("doctor")
     doctor.add_argument("--project-root", default=".")
     doctor.add_argument("--output", default="results/doctor.json")
@@ -107,6 +122,25 @@ def main(argv=None) -> int:
     evaluation.add_argument("--results", required=True)
     evaluation.add_argument("--output", required=True)
     args = parser.parse_args(argv)
+    if args.command == 'capture-ui':
+        from .capture_ui import serve_capture
+        serve_capture(args.config, port=args.port, output=args.output, synthetic=args.synthetic)
+        return 0
+    if args.command in ('prepare-capture', 'export-capture'):
+        from .capture_import import prepare_capture, export_ffv1
+        try:
+            if args.command == 'export-capture':
+                payload = export_ffv1(_path(args.session), allow_interrupted=args.allow_interrupted)
+            else:
+                config = FrameConfig(**_read_json(args.config)) if args.config else FrameConfig()
+                payload = prepare_capture(_path(args.session), _path(args.output), config,
+                                          _path(args.calibration) if args.calibration else None,
+                                          allow_interrupted=args.allow_interrupted)
+            print(json.dumps(payload, ensure_ascii=False, indent=2))
+            return 0
+        except (OSError, ValueError, RuntimeError, KeyError, TypeError, subprocess.SubprocessError) as exc:
+            print(json.dumps({'status': 'capture_error', 'reason': str(exc)}, ensure_ascii=False))
+            return 2
     if args.command == "doctor":
         report = collect_doctor(_path(args.project_root))
         write_doctor(_path(args.output), report)

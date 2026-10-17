@@ -25,12 +25,17 @@ vision = [
 ]
 test = ["coverage>=7.0"]
 viewer = ["viser==1.1.1", "pillow>=10"]
+capture = ["viser==1.1.1", "pillow>=10", "opencv-python>=4.8"]
 
 [project.scripts]
 go1loc = "go1loc.cli:main"
+go1-workbench = "go1loc.workbench:main"
 
 [tool.setuptools]
 package-dir = {"" = "src"}
 
 [tool.setuptools.packages.find]
 where = ["src"]
+
+[tool.setuptools.package-data]
+go1loc = ["capture_frontend/*.html", "capture_frontend/*.css", "capture_frontend/*.js", "capture_frontend/*.svg"]

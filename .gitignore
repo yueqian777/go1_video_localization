@@ -6,6 +6,8 @@
 /.upstream/
 /data/
 /results/
+/.playwright-cli/
+/output/playwright/
 __pycache__/
 *.egg-info/
 /.coverage

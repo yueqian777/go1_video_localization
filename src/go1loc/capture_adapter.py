@@ -33,9 +33,18 @@ class OfflineVideoAdapter(CaptureAdapter):
 
 
 class Go1ReadonlyShmAdapter(CaptureAdapter):
-    """Placeholder boundary kept intentionally disabled until separately authorized."""
+    """Explicit manual authorization boundary; constructing never connects."""
 
-    def __init__(self, config: CaptureConfig):
+    def __init__(self, config: CaptureConfig, *, connection=None, camera_id=1, authorized=False):
         if config.mode != "go1_readonly_shm":
             raise ValueError("invalid_capture_mode")
-        raise RuntimeError("robot_capture_disabled_in_offline_project")
+        if not authorized:
+            raise RuntimeError("robot_capture_disabled_in_offline_project")
+        if not config.own_resources_only or connection is None:
+            raise ValueError('readonly_connection_config_required')
+        self.config, self.connection, self.camera_id = config, connection, camera_id
+
+    def capture(self):
+        """Return an unstarted source; caller must explicitly call start/connect."""
+        from .capture_transport import SSHSource
+        return SSHSource(self.connection, self.camera_id, authorized=True)

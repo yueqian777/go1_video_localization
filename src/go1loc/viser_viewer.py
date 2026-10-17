@@ -311,7 +311,8 @@ def _app_locked(method):
 
 
 class ViewerApplication(NavigationControls, PhotoSelectionControls, RouteWorkflowControls, PlaybackControls, BuildGuideControls, WebBuildControls):
-    def __init__(self, map_dir, sidecar_dir, *, port=8765, query_dir=None, snapshot_dir=None, server=None):
+    def __init__(self, map_dir, sidecar_dir, *, port=8765, query_dir=None, snapshot_dir=None, server=None,
+                 load_initial=True, live_reader_factory=None):
         self.map_dir = Path(map_dir).resolve()
         self.sidecar = ensure_sidecar(self.map_dir, sidecar_dir)
         self.sidecar.mkdir(parents=True, exist_ok=True)
@@ -342,9 +343,13 @@ class ViewerApplication(NavigationControls, PhotoSelectionControls, RouteWorkflo
         self.target_result = None
         self.target_photo = None
         self.current_start = None
+        self.live_reader_factory = live_reader_factory
         self._ui()
         server.on_client_connect(self._connect)
-        self._submit('inspect_map', {})
+        if load_initial:
+            self._submit('inspect_map', {})
+        else:
+            self._message('尚无地图。请先录制并选择记录，检查首帧后开始建图。')
         self._thread = threading.Thread(target=self._poll, name='go1loc-viewer-poll', daemon=True)
         self._thread.start()
         self._start_playback_thread()

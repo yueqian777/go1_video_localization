@@ -1,0 +1,31 @@
+{
+  "defaults": {
+    "jump": "pi@192.168.12.1",
+    "remote_python": "/usr/bin/python3",
+    "remote_agent": "/home/unitree/go1_capture_20261015/capture_agent.py",
+    "rate": 10.0,
+    "max_seconds": 120.0,
+    "max_mbps": 60.0,
+    "queue_size": 2,
+    "timeout_s": 5.0,
+    "width": 464,
+    "height": 400,
+    "projection": "unknown"
+  },
+  "cameras": {
+    "1": {"target": "unitree@192.168.123.13"},
+    "2": {"target": "unitree@192.168.123.13"},
+    "3": {"target": "unitree@192.168.123.14"},
+    "4": {"target": "unitree@192.168.123.14"},
+    "5": {"target": "unitree@192.168.123.15"},
+    "6": {
+      "target": "pi@192.168.12.1",
+      "jump": null,
+      "source_kind": "orbbec_rgb_mjpeg",
+      "remote_agent": "/home/pi/go1_rgb_capture_20261016/capture_rgb_agent.py",
+      "width": 1280,
+      "height": 720,
+      "rate": 15.0
+    }
+  }
+}

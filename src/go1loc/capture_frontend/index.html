@@ -1,0 +1,100 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Go1 相机录制台</title>
+  <link rel="icon" type="image/svg+xml" href="/icon.svg">
+  <link rel="stylesheet" href="/style.css">
+  <script src="/session.js" defer></script>
+  <script src="/preview-timing.js" defer></script>
+  <script src="/app.js" defer></script>
+  <script src="/workspace.js" defer></script>
+</head>
+<body>
+  <header class="topbar">
+    <a class="brand" href="/" aria-label="Go1 相机录制台首页"><img src="/icon.svg" alt="" width="40" height="40"><span><strong>Go1 <span class="brand-light">Capture</span></strong><small>相机预览与录制工作台</small></span></a>
+    <div class="top-actions"><span class="local-badge"><span class="dot"></span>仅在本机运行</span><button id="quit" class="button quiet">退出录制台</button></div>
+  </header>
+
+  <section id="workspace-bar" class="workspace-bar" hidden aria-label="统一工作台">
+    <div class="workspace-tabs" role="tablist" aria-label="工作流程">
+      <button id="tab-capture" class="button secondary" role="tab" aria-selected="true">① 摄像头与录制</button>
+      <button id="tab-map" class="button secondary" role="tab" aria-selected="false">② 建图 · 定位 · 路线</button>
+    </div>
+    <div class="workspace-transfer">
+      <label>已保存录像<select id="workspace-recordings" aria-label="选择已保存录像"></select></label>
+      <button id="workspace-build" class="button primary" disabled>送入建图，检查首帧</button>
+      <button id="workspace-live" class="button secondary" disabled>使用此相机实时定位</button>
+    </div>
+    <p id="workspace-status" role="status">正在读取工作台状态…</p>
+    <p id="workspace-message" aria-live="polite">录像保存后直接建图；定位源帧与预览共用一条采集连接。只显示方向，不控制运动。</p>
+  </section>
+  <section id="map-main" hidden aria-label="地图定位与导航">
+    <iframe id="workspace-map" title="三维地图、照片定位和路线引导" referrerpolicy="no-referrer"></iframe>
+  </section>
+  <main id="capture-main">
+    <section class="page-heading">
+      <div><p class="eyebrow">CAMERA WORKSPACE</p><h1>看清画面，记录现场。</h1><p class="subheading">选择一个视角，预览、抓拍，或开始一次手动录制。</p></div>
+      <label class="mode-picker">图像来源<select id="mode"><option value="robot">Go1 网络相机</option><option value="demo">离线演示 · 合成图像</option></select></label>
+    </section>
+
+    <div class="workspace">
+      <aside class="camera-panel" aria-label="选择相机">
+        <div class="section-label">相机视角 <span>06</span></div>
+        <div id="cameras" class="camera-list">
+          <button class="camera selected" data-camera="1" aria-pressed="true"><span class="camera-number">01</span><span><strong>前视相机</strong><small>FRONT</small></span><span class="selection-dot"></span></button>
+          <button class="camera" data-camera="2" aria-pressed="false"><span class="camera-number">02</span><span><strong>下巴相机</strong><small>CHIN</small></span><span class="selection-dot"></span></button>
+          <button class="camera" data-camera="3" aria-pressed="false"><span class="camera-number">03</span><span><strong>左侧相机</strong><small>LEFT</small></span><span class="selection-dot"></span></button>
+          <button class="camera" data-camera="4" aria-pressed="false"><span class="camera-number">04</span><span><strong>右侧相机</strong><small>RIGHT</small></span><span class="selection-dot"></span></button>
+          <button class="camera" data-camera="5" aria-pressed="false"><span class="camera-number">05</span><span><strong>后下相机</strong><small>REAR / DOWN</small></span><span class="selection-dot"></span></button>
+          <button class="camera" data-camera="6" aria-pressed="false"><span class="camera-number">06</span><span><strong>Gemini 335L RGB</strong><small>外接 RGB · 720P / 15 FPS</small></span><span class="selection-dot"></span></button>
+        </div>
+        <p class="sidebar-note">一次预览一个视角。<br>切换前请先断开当前相机。</p>
+        <div class="boundary-note"><span class="shield">◇</span><strong>只采集，不控制运动</strong><p>不会部署程序、修改原厂服务，或发送运动指令。</p></div>
+      </aside>
+
+      <section class="preview-column" aria-label="相机画面">
+        <div class="preview-card">
+          <div class="preview-header"><div><span class="camera-tag" id="camera-tag">CAM 01</span><h2 id="camera-title">前视相机</h2></div><span id="connection-state" class="state-pill">未连接</span></div>
+          <div class="preview-stage" id="preview-stage">
+            <img id="preview" alt="所选相机的图像预览" hidden>
+            <div class="empty-preview" id="empty-preview">
+              <svg viewBox="0 0 64 64" width="64" height="64" aria-hidden="true"><rect x="10" y="19" width="44" height="32" rx="8"/><path d="m21 19 4-8h14l4 8"/><circle cx="32" cy="35" r="10"/><path d="M46 26h1"/></svg>
+              <h3 id="empty-title">画面将在连接后显示</h3><p id="empty-description">请确认网络与 SSH 配置，然后手动连接相机。</p><button class="button demo-link" id="try-demo">没有机器狗？先试用离线演示 →</button>
+            </div>
+          </div>
+          <div class="preview-footer"><span id="resolution">— × —</span><span id="preview-rate">预览 — updates/s</span><span id="source-label">原始画面 · 无文字烧录</span><button id="fullscreen" class="text-button" disabled>全屏看图 ↗</button></div>
+        </div>
+        <div id="health" class="health-note" role="status"><span class="health-icon">i</span><div><strong id="health-title">等待连接</strong><p id="health-text">启动页面不会自动访问机器狗。</p></div></div>
+        <div class="metrics" aria-label="采集统计">
+          <div><small>接收速率</small><strong id="rate">—</strong><span>reads/s · 非曝光帧率</span></div>
+          <div><small>已接收样本</small><strong id="received">0</strong><span>当前连接</span></div>
+          <div><small>已写入图像</small><strong id="written">0</strong><span>本次 / 最近录像</span></div>
+          <div><small>队列 / 丢弃</small><strong id="queue">0 / 0</strong><span>写盘状态</span></div>
+        </div>
+      </section>
+
+      <aside class="controls-column" aria-label="连接和录制控制">
+        <section class="control-card"><div class="section-label">01 / 连接相机</div>
+          <label id="authorization-label" class="checkbox-label"><input id="authorized" type="checkbox"><span>确认只读连接所选相机</span></label>
+          <p id="connection-hint" class="helper">需要已连接 Go1 网络，并配置免密 SSH 与主机指纹。页面不自动配置这些内容。</p>
+          <button id="connect" class="button primary" disabled>连接相机</button><button id="disconnect" class="button secondary" disabled>断开连接</button>
+        </section>
+        <section class="control-card recording-card"><div class="section-label">02 / 手动录制 <span id="timer">00:00</span></div>
+          <label class="field-label" for="session-name">会话名称</label><input id="session-name" type="text" value="go1_camera" maxlength="64" autocomplete="off" spellcheck="false">
+          <button id="record" class="button record" disabled><span class="record-dot"></span>开始录制</button>
+          <button id="stop" class="button stop" disabled><span class="stop-square"></span>停止录制</button>
+          <div class="button-pair"><button id="snapshot" class="button secondary" disabled>抓拍源图</button><button id="export" class="button secondary" disabled>导出视频</button></div>
+          <p class="helper">停止后先保存 PNG，点击“导出视频”生成 FFV1 MKV。外接 RGB 的原生 MJPEG 已有压缩，PNG／MKV 不再损失解码后的像素。停止录制不是机器人急停。</p>
+        </section>
+        <section class="save-card"><div class="section-label">文件保存到本机</div><p id="save-directory" class="path">正在读取…</p><button id="open-folder" class="text-button">打开保存文件夹 ↗</button></section>
+      </aside>
+    </div>
+
+    <section class="activity" aria-label="最近操作"><div><span class="section-label">最近操作</span><p id="activity-text" role="status" aria-live="polite">页面已就绪。连接相机前，预览和录像都不会启动。</p></div><span id="busy-indicator" hidden>正在处理…</span></section>
+    <details class="details"><summary>连接说明与高级信息</summary><div class="details-grid"><div><h3>真实相机连接</h3><p>使用项目现有的双级 SSH 只读代理。若出现认证失败，请先按操作手册确认免密登录；本页不会新增公钥，也不会修改原厂服务。单次连接时限由配置中的 max_seconds 决定，最多 600 秒，到期需手动重连。</p><p>连接配置：<code id="config-path">—</code></p></div><div><h3>录像与新鲜度</h3><p>重复画面只会提示“疑似冻结”，静止场景也可能触发。接收中断后旧图会隐藏，录像标为中断且不会自动续录。代理读序号不等于相机曝光序号。</p><p>本机会话过期会自动恢复，但不会自动重发连接或录制操作。关闭网页不会停止后台录像；结束工作请使用右上角“退出录制台”。</p></div></div></details>
+    <footer>GO1 CAPTURE <span>本地保存 · 手动连接 · 不含运动控制</span></footer>
+  </main>
+</body>
+</html>
