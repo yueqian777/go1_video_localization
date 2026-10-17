@@ -8,7 +8,7 @@
 
 .workspace-bar{margin:14px 3% 0;padding:16px 20px;border:1px solid var(--line);border-radius:12px;background:#fff}
 .workspace-tabs,.workspace-transfer{display:flex;align-items:center;gap:12px;flex-wrap:wrap}
-.workspace-tabs{margin-bottom:14px}.workspace-tabs [aria-selected=true]{background:#176f83;color:white}
+.workspace-tabs{margin-bottom:14px}.workspace-tabs [aria-selected=true],.workspace-tabs [aria-selected=true]:hover:not(:disabled){background:#176f83;color:white}
 .workspace-transfer label{display:flex;gap:12px;align-items:center;min-width:0;flex:1}
 .workspace-transfer select{min-width:0;max-width:100%;flex:1;padding:10px;border:1px solid var(--line);border-radius:7px}
 .workspace-bar p{font-size:12px;line-height:1.7;margin:10px 0 0;color:#526a78}
