@@ -23,6 +23,11 @@ class PhotoObjectTests(unittest.TestCase):
         a = ground_evidence(evidence(), (0, 0, 10, 10))
         b = ground_evidence(evidence(100), (0, 0, 10, 10))
         self.assertEqual(a['supporting_point3D_ids'], b['supporting_point3D_ids'])
+        self.assertEqual(set(a['supporting_points3D']), set(b['supporting_points3D']))
+        np.testing.assert_allclose(
+            np.asarray(list(a['supporting_points3D'].values())) * 100,
+            np.asarray(list(b['supporting_points3D'].values())),
+        )
         np.testing.assert_allclose(np.array(a['object_surface_position'])*100, b['object_surface_position'])
 
     def test_failed_localization_rejected(self):

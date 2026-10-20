@@ -12,6 +12,10 @@ import numpy as np
 class ObjectSupport:
     status: str
     supporting_point3D_ids: list[int] = field(default_factory=list)
+    # Keep the actual map coordinates beside the IDs so an exported target
+    # result is self-contained for inspection and downstream route preview.
+    # JSON object keys are strings even when the native point IDs are ints.
+    supporting_points3D: dict[str, list[float]] = field(default_factory=dict)
     supporting_frame_ids: list[str] = field(default_factory=list)
     object_surface_position: list[float] | None = None
     object_extent: dict[str, list[float]] | None = None
@@ -47,6 +51,10 @@ def _candidate(ids: list[int], frame_ids: list[str], points: np.ndarray) -> dict
     high = points.max(axis=0)
     return {
         "supporting_point3D_ids": ids,
+        "supporting_points3D": {
+            str(point_id): points[index].tolist()
+            for index, point_id in enumerate(ids)
+        },
         "supporting_frame_ids": sorted(set(frame_ids)),
         "surface_position": points.mean(axis=0).tolist(),
         "extent": {"min": low.tolist(), "max": high.tolist()},
@@ -98,6 +106,7 @@ def support_from_roi_matches(
     return ObjectSupport(
         status="supported",
         supporting_point3D_ids=selected["supporting_point3D_ids"],
+        supporting_points3D=selected["supporting_points3D"],
         supporting_frame_ids=selected["supporting_frame_ids"],
         object_surface_position=selected["surface_position"],
         object_extent=selected["extent"],

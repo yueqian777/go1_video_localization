@@ -24,6 +24,10 @@ class ObjectGroundingTests(unittest.TestCase):
         )
         self.assertEqual(support.status, "supported")
         self.assertEqual(support.supporting_point3D_ids, [10, 11])
+        self.assertEqual(
+            support.supporting_points3D,
+            {"10": [1.0, 2.0, 3.0], "11": [2.0, 2.0, 3.0]},
+        )
         np.testing.assert_allclose(support.object_surface_position, [1.5, 2.0, 3.0])
         self.assertEqual(support.supporting_frame_ids, ["f1", "f2"])
 

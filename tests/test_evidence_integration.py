@@ -132,6 +132,10 @@ class EvidenceIntegrationTests(EvidenceWorkspace):
                                          query_dir=self.query_dir, cluster_radius=1)
         self.assertEqual(result["status"], "supported")
         self.assertEqual(result["supporting_point3D_ids"], [100, 101, 102, 103])
+        self.assertEqual(
+            result["supporting_points3D"]["100"],
+            [0.0, 0.0, 1.0],
+        )
         self.assertEqual(result["query_sha256"], sha256_file(self.photo))
         self.assertEqual(result["map_hash"], self.manifest["manifest_sha256"])
         self.assertEqual(result["component_id"], "c0")
