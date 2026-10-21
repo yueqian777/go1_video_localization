@@ -14,22 +14,24 @@ def _pose(x, y, z=0.0):
     return T.tolist()
 
 
-def _observation(name, t, seq, xyz, refs=("a.png", "m.png"), source="s" * 64):
+def _observation(name, t, seq, xyz, refs=("a.png", "m.png"), source="a" * 64):
     return dict(name=name, pts_time_s=t, source_sequence=seq,
                 T_MC=_pose(*xyz), evidence_sha256=(name + "evidence").encode().hex().ljust(64, "0")[:64],
                 query_sha256=(name + "query").encode().hex().ljust(64, "0")[:64],
                 references=list(refs), source_sha256=source, session_id="trace-session",
                 camera_id="camera6", quality=dict(unique_inlier_keypoints=50,
-                    inlier_ratio=.5, inlier_4x4_grid_coverage=.5,
+                    num_inliers=50, inlier_ratio=.5, inlier_4x4_grid_coverage=.5,
                     p95_inlier_reprojection_px=2.0))
 
 
 def _anchors():
-    source = "s" * 64
+    source = "a" * 64
     return [
         dict(role="entry", edge_id="auto:1", fraction=0.0,
+             projection=[0.0, 2.0, 0.0],
              observation=_observation("entry", 0.0, 10, (0, 2, 0), source=source)),
         dict(role="exit", edge_id="auto:1", fraction=1.0,
+             projection=[2.0, 2.0, 0.0],
              observation=_observation("exit", 0.4, 14, (2, 2, 0), source=source)),
     ]
 
@@ -51,13 +53,15 @@ class RouteTraceTests(unittest.TestCase):
         added = [e for e in repaired["edges"].values()
                  if e.get("provenance", {}).get("trace_id") == "trace-1"]
         self.assertTrue(added)
-        self.assertTrue(all(e["provenance"]["kind"] == "verified_route_trace_observation" for e in added))
+        self.assertTrue(any(e["provenance"]["kind"] == "verified_route_trace_observation" for e in added))
+        self.assertTrue(all(e["provenance"]["kind"] in {
+            "verified_route_trace_observation", "verified_route_trace_anchor_projection"} for e in added))
         self.assertNotIn("verified_continuous", str(added))
         self.assertFalse(repaired["execution_permitted"])
         trace_entry = next(e for e in added if e["from"].startswith("trace-1:anchor:entry")
                            and e["to"] == "trace:1:0")
         association = dict(status="associated", edge_id=trace_entry["edge_id"], fraction=1.0,
-                           projection=samples[0]["T_MC"][:3][3],
+                           projection=[0.0, 2.4, 0.0],
                            tracking_observation=None)
         plan = plan_guidance(repaired, association, [{"node_id": "m.png", "quality": 1.0}])
         self.assertEqual(plan["status"], "planned")

@@ -27,6 +27,8 @@ def prepare_index(map_dir, sidecar, declaration, *, publish=True):
     graph=fuse_junctions(graph,native_junction_observations(model,graph))
     from .navigation_gap import load_gap_recoveries
     graph=load_gap_recoveries(graph,manifest,frames,sidecar)
+    from .navigation_trace import load_route_trace
+    graph=load_route_trace(graph,sidecar)
     if publish:
         save_navigation_index(sidecar,map_dir,graph)
     return graph
