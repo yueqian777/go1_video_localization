@@ -112,6 +112,34 @@ class PlaybackUITests(unittest.TestCase):
         self.app._playback_slider_changed(SimpleNamespace(client=None))
         self.assertTrue(self.app.playback_clock.playing)
 
+    def test_user_reference_selection_shows_photo_and_syncs_timeline(self):
+        model = self.payload()
+        model['cameras'][0]['name'] = self.photo.name
+        second = dict(model['cameras'][0], name=self.other.name,
+                      image_path=str(self.other), pts_time_s=2.)
+        model['cameras'].append(second)
+        model['playback'] = playback_timeline({'source_kind': 'video', 'frames': [
+            dict(image_path=str(self.photo), pts_time_s=0, frame_index=0),
+            dict(image_path=str(self.other), pts_time_s=2, frame_index=1)]},
+            model['cameras'], self.root)
+        self.app.controller.replace_model(model)
+        self.app.frame.options = [self.photo.name, self.other.name]
+        self.app._reset_playback(model)
+        self.app.frame.value = self.other.name
+        self.app.playback_clock.play(0)
+
+        # The playback thread changes the dropdown without pausing playback.
+        self.app._reference_selection_changed(SimpleNamespace(client=None))
+        self.assertTrue(self.app.playback_clock.playing)
+
+        # A real user selection pauses and shows the selected frame.
+        self.app._reference_selection_changed(SimpleNamespace(client=self.client))
+        self.assertFalse(self.app.playback_clock.playing)
+        self.assertEqual(self.app.playback_clock.index, 1)
+        self.assertTrue(self.app.reference_image.visible)
+        self.assertTrue(np.all(self.app.reference_image.image[:, :, 2] == 255))
+        self.assertEqual(self.app.playback_slider.value, 1)
+
     def test_pause_between_ticks_keeps_photo_and_index_in_sync(self):
         model = self.payload()
         self.app.controller.replace_model(model)
@@ -138,6 +166,68 @@ class PlaybackUITests(unittest.TestCase):
             self.assertFalse(self.app.playback_clock.playing)
             self.app._playback_step(-1)
             self.assertEqual(self.app.playback_clock.index, 0)
+
+
+class PlaybackVisibilityTests(unittest.TestCase):
+    """Use real Viser containers: an image's own visible flag is not enough."""
+    def test_default_ui_exposes_reference_and_playback_without_research_mode(self):
+        import viser
+        from PIL import Image
+        from go1loc.viser_viewer import ViewerApplication
+        cache = Path(__file__).resolve().parents[1]/'.cache'/'tests'
+        cache.mkdir(parents=True, exist_ok=True)
+        with tempfile.TemporaryDirectory(dir=cache) as tmp:
+            root = Path(tmp)
+            server = viser.ViserServer(host='127.0.0.1', port=0)
+            app = None
+            try:
+                app = ViewerApplication(root/'map', root/'ui', server=server, load_initial=False)
+                payload = ui.model()
+                payload['cameras'] = []
+                for i, color in enumerate(('red', 'blue')):
+                    photo = root/f'frame{i}.png'
+                    Image.new('RGB', (20, 10), color).save(photo)
+                    camera = ui.model()['cameras'][0]
+                    camera.update(name=photo.name, image_path=str(photo), pts_time_s=float(i))
+                    payload['cameras'].append(camera)
+                payload['playback'] = playback_timeline(None, payload['cameras'], root)
+                app.controller.replace_model(payload)
+                app.frame.options = [c['name'] for c in payload['cameras']]
+                app._reset_playback(payload)
+                self.assertFalse(app.research_mode.value)
+
+                def assert_exposed(handle):
+                    while True:
+                        self.assertTrue(getattr(handle, 'visible', True), 'control hidden by an ancestor')
+                        if hasattr(handle, '_parent'):  # Viser tab
+                            handle = handle._parent
+                            continue
+                        parent = handle._impl.parent_container_id
+                        if parent == 'root':
+                            break
+                        handle = server.gui._container_handle_from_uuid[parent]
+
+                for handle in (app.frame, app.reference_info, app.playback_slider, app.playback_speed):
+                    assert_exposed(handle)
+                with app._state_lock:
+                    app._reference_clicked(SimpleNamespace(client=None), payload['cameras'][1])
+                    assert_exposed(app.reference_image)
+                    self.assertEqual(app.playback_clock.index, 1)
+                    self.assertEqual(app.playback_slider.value, 1)
+                    self.assertTrue(np.all(app.reference_image.image[:, :, 2] == 255))
+                    app._playback_restart(None)
+                    self.assertTrue(app.playback_clock.playing)
+                    app._pause_playback()
+                    app._playback_step(1)
+                    self.assertEqual(app.frame.value, 'frame1.png')
+                    self.assertFalse(app.playback_clock.playing)
+                    self.assertIsNone(app.current_start)
+                    self.assertIsNone(app.target_result)
+            finally:
+                if app:
+                    app.close()
+                else:
+                    server.stop()
 
 
 if __name__ == '__main__': unittest.main()

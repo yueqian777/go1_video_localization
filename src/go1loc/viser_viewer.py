@@ -381,6 +381,16 @@ class ViewerApplication(NavigationControls, PhotoSelectionControls, RouteWorkflo
         self.notice = gui.add_text('当前提示', '正在读取地图，请稍候。', multiline=True, disabled=True)
         self.overview = gui.add_markdown('地图载入后显示任务进度。')
         self._button('恢复地图总览', self._return_map)
+        # Everyday map browsing must stay outside the optional research tabs.
+        # Keep the photo at the root so a map click cannot update a hidden tab.
+        gui.add_markdown('### 地图照片与全程回放\n点击地图中的相机线框，或在下方选择历史参考帧，即可查看该位置的照片。')
+        self.frame = gui.add_dropdown('选择历史参考帧', ['（正在载入）'])
+        self.frame.on_update(self._guard(self._reference_selection_changed))
+        self.follow_reference = gui.add_checkbox('同时进入该相机视角（可选）', False)
+        self._button('查看参考照片与拍摄位置', self._show_frame)
+        self.reference_image = gui.add_image(np.zeros((2, 2, 3), np.uint8), label='历史参考照片（不是实时画面）', visible=False)
+        self.reference_info = gui.add_text('所选参考帧信息', '点击地图相机或选择参考帧查看照片；下方可连续播放全程图片。', multiline=True, disabled=True)
+        self._playback_ui()
         self._web_build_ui()
         self.navigation_panel = gui.add_folder('开始找物与方向引导', expand_by_default=True)
         self.research_mode = gui.add_checkbox('显示研究模式与旧流程（人工起点、逐段审核、证据导入）', False)
@@ -402,13 +412,7 @@ class ViewerApplication(NavigationControls, PhotoSelectionControls, RouteWorkflo
             with gui.add_folder('高级：地图分量', expand_by_default=False):
                 self.component = gui.add_text('分量编号（留空使用第一个）', '')
             self._button('加载所选地图或快照', self._load_mode)
-            self.frame = gui.add_dropdown('选择历史参考帧', ['（正在载入）'])
-            self.follow_reference = gui.add_checkbox('同时进入该相机视角（可选）', False)
-            self._button('查看参考照片与拍摄位置', self._show_frame)
-            self.reference_image = gui.add_image(np.zeros((2, 2, 3), np.uint8), label='历史参考照片（不是实时画面）', visible=False)
-            self.reference_info = gui.add_text('所选参考帧信息', '请选择参考帧并点击查看。', multiline=True, disabled=True)
-            gui.add_markdown('参考帧的时间是素材记录时间。屏幕录制的显示时间不等于传感器曝光时间。')
-            self._playback_ui()
+            gui.add_markdown('查看位置照片、按视频顺序播放全程图片：请使用主面板上方的「地图照片与全程回放」，无需打开研究模式。')
             self._build_guide_ui()
         with self._object_tab:
             gui.add_markdown('### 用独立照片寻找物体\n**选照片 → 打开原图 → 鼠标左键拖出绿框 → 计算。**\n\n'
@@ -436,7 +440,7 @@ class ViewerApplication(NavigationControls, PhotoSelectionControls, RouteWorkflo
                 self.camera_params = gui.add_text('相机内参 JSON 数组（可选）', '')
                 self.calibration = gui.add_text('标定文件路径（可选）', '')
         with self._start_tab:
-            gui.add_markdown('### 路线从哪里出发？\n**入门方法：人工历史起点。** 在「① 地图」选择参考帧，再点下面按钮。它不是机器狗的实时位置。')
+            gui.add_markdown('### 路线从哪里出发？\n**入门方法：人工历史起点。** 在主面板的「地图照片与全程回放」选择参考帧，再点下面按钮。它不是机器狗的实时位置。')
             self._button('将选中参考帧设为人工起点', self._manual_start)
             with gui.add_folder('进阶：定位独立当前照片', expand_by_default=False):
                 gui.add_markdown('目标照片不能冒充当前位置。照片定位后仍需合法接入证据，不会自动吸附最近节点。')
@@ -643,8 +647,15 @@ class ViewerApplication(NavigationControls, PhotoSelectionControls, RouteWorkflo
         return next(c for c in self.controller.model['cameras'] if c['name'] == self.frame.value)
 
     def _reference_clicked(self, event, camera):
-        self.frame.value = camera['name']
-        self._show_frame(event)
+        with self._state_lock:
+            self.frame.value = camera['name']
+            self._show_frame(event)
+
+    def _reference_selection_changed(self, event):
+        # Playback and map-loading also set the dropdown. Only user selection
+        # should pause playback; server-generated callbacks have no client.
+        if event.client is not None:
+            self._show_frame(event)
 
     def _show_frame(self, event):
         self._pause_playback()
@@ -656,6 +667,15 @@ class ViewerApplication(NavigationControls, PhotoSelectionControls, RouteWorkflo
         if camera.get('image_path') and Path(camera['image_path']).is_file():
             self.reference_image.image = _read_image(camera['image_path'])
             self.reference_image.visible = True
+        if not self.reference_image.visible:
+            self.reference_info.value += '\n这张参考照片文件缺失，暂时只能显示拍摄位置。'
+        index = next((i for i, row in enumerate(self.playback_data.get('frames', []))
+                      if row.get('camera_name') == camera['name']), None)
+        if index is not None and self.playback_clock.times:
+            self.playback_clock.seek(index, time.monotonic())
+            self._playback_rendered = index
+            self.playback_slider.value = index
+            self._playback_status()
         if event.client and self.follow_reference.value:
             T, q = _pose(camera['T_WC'])
             event.client.camera.position = T[:3, 3]
