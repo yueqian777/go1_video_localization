@@ -226,6 +226,24 @@ class ViewerTests(unittest.TestCase):
             view.load_plan(payload)
         self.assertNotIn('/route/path', view.server.scene.active)
 
+    def test_free_space_preview_is_bound_to_map_and_renders_state_colors(self):
+        from go1loc.free_space import build_free_space_map, free_space_payload
+
+        view = SceneController(Server())
+        view.replace_model(model())
+        grid = build_free_space_map([[0, 0, 0], [1, 0, 0], [2, 0, 0], [1, 0, .8]],
+                                    resolution=1.0, ground_height=0.0)
+        payload = free_space_payload(grid, map_id='m', map_hash='h', component_id='c0',
+                                     units='map_units', scale_status='arbitrary_monocular_scale')
+        view.load_free_space(payload)
+        self.assertIn('/free-space/free', view.server.scene.active)
+        self.assertIn('/free-space/uncertain', view.server.scene.active)
+        self.assertIn('/free-space/status', view.server.scene.active)
+        bad = dict(payload, map_hash='other')
+        with self.assertRaisesRegex(ValueError, 'free_space_map_mismatch'):
+            view.load_free_space(bad)
+        self.assertNotIn('/free-space/free', view.server.scene.active)
+
     def test_framing_ignores_outlier_only_for_camera_not_geometry(self):
         payload = model()
         payload['points'] = [[i/100., i/100., 1] for i in range(100)]+[[1000000, 0, 0]]
