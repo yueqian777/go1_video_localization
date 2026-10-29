@@ -41,19 +41,76 @@ def _simulate_closed_loop(grid, start, goal, *, heading="E", stale_age=None,
     navigator.prepare()
     navigator.authorize()
     x, y = start
+    current_heading = heading
+    source_sequence = 0
+    pending = None
+    now = 0.0
     events = []
-    for step in range(128):
-        age = stale_age if step == 1 and stale_age is not None else 0.0
-        observation = PoseObservation(x=float(x), y=float(y), heading=heading,
-                                      received_age_s=age, localized=True)
-        telemetry = Telemetry(healthy=True, stopped=feedback_stopped)
-        command = navigator.step(observation, telemetry, now=float(step))
-        events.append(command.primitive)
-        if command.primitive == "forward" and command.cell is not None:
-            x, y = command.cell
+    target_visible = False
+
+    def observation(age=0.0):
+        return PoseObservation(x=float(x), y=float(y), heading=current_heading,
+                               received_age_s=age, localized=True,
+                               frame_id=f"offline-{source_sequence}",
+                               capture_session_id="offline-session",
+                               source_sequence=source_sequence,
+                               source_time_s=now, received_time_s=now,
+                               localization_time_s=now, map_version="offline-map",
+                               localization_quality=1.0, target_visible=target_visible)
+
+    for _ in range(256):
+        # A new visual frame is required before issuing a subsequent action.
+        source_sequence += 1
+        age = stale_age if stale_age is not None and pending is not None else 0.0
+        if pending is None:
+            telemetry = Telemetry(True, True, motion_feedback="stopped",
+                                  feedback_time_s=now)
+            command = navigator.step(observation(age), telemetry, now=now)
+            events.append(command.primitive)
+            if command.primitive in {"wait", "stop"}:
+                if navigator.state in {NavigationState.ARRIVED, NavigationState.STOPPED,
+                                       NavigationState.MOTION_FAULT}:
+                    break
+                if navigator.awaiting_goal_observation:
+                    target_visible = True
+                now += 0.1
+                continue
+            pending = command
+            now += 0.2
+            continue
+
+        # Feedback may arrive while the robot is still moving. No visual
+        # displacement is applied at command issuance or at this intermediate tick.
+        telemetry = Telemetry(True, feedback_stopped, motion_feedback=(
+            "stopped" if feedback_stopped else "executing"),
+            command_id=pending.command_id, feedback_time_s=now)
+        delayed = navigator.step(observation(age), telemetry, now=now)
+        if delayed.primitive not in {"wait", "stop"}:
+            events.append(delayed.primitive)
+        if navigator.state in {NavigationState.STOPPED, NavigationState.MOTION_FAULT}:
+            events.append(delayed.primitive)
+            break
+        now += 0.2
+        if not feedback_stopped:
+            events.append(delayed.primitive)
+            break
+
+        # The simulated controller changes pose only after the bounded primitive
+        # completes and emits a new visual frame for confirmation.
+        if pending.primitive in {"turn_left", "turn_right"}:
+            current_heading = pending.target_heading or current_heading
+        elif pending.primitive == "forward" and pending.cell is not None:
+            x, y = pending.cell
+        source_sequence += 1
+        telemetry = Telemetry(True, True, motion_feedback="stopped",
+                              command_id=pending.command_id, feedback_time_s=now)
+        confirmed = navigator.step(observation(), telemetry, now=now)
+        events.append(confirmed.primitive)
+        pending = None
         if navigator.state in {NavigationState.ARRIVED, NavigationState.STOPPED,
                                NavigationState.MOTION_FAULT}:
             break
+        now += 0.1
     return route, events, navigator.state
 
 

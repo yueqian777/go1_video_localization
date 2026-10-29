@@ -185,6 +185,7 @@ class SceneController:
         self.model = None
         self.mode = 'final_map_replay'
         self.displayed_points = 0
+        self.free_space_grid = None
         self._lock = threading.RLock()
         self.on_reference_click = None
 
@@ -221,6 +222,7 @@ class SceneController:
                 self.clear(group)  # all old BA geometry and final-map overlays retired
             self.model = deepcopy(payload)
             self.mode = payload['mode']
+            self.free_space_grid = None
             self.displayed_points = len(indices)
             scene = self.server.scene
             if hasattr(scene, 'set_up_direction'):
@@ -302,6 +304,27 @@ class SceneController:
             self.pose('goal', payload['goal_observation_pose'], color=(80, 230, 110))
 
     @_scene_locked
+    def load_free_space_route(self, payload):
+        """Render a grid route preview using cell centres from the same sidecar."""
+        self.clear('free_space_route')
+        if self.free_space_grid is None:
+            raise ValueError('free_space_sidecar_not_loaded')
+        if payload.get('execution_permitted') is not False:
+            raise ValueError('free_space_route_execution_contract_invalid')
+        cells = [tuple(int(value) for value in row[:2]) for row in payload.get('path', [])]
+        points = np.asarray([self.free_space_grid.cell_to_world(cell) + (0.0,)
+                             for cell in cells], dtype=float)
+        with self.server.atomic():
+            if len(points) > 1:
+                self._keep('free_space_route', self.server.scene.add_line_segments(
+                    '/free-space-route/path', points=np.stack((points[:-1], points[1:]), axis=1),
+                    colors=(40, 230, 235), thickness=4., thickness_units='screen'))
+            self._keep('free_space_route', self.server.scene.add_label(
+                '/free-space-route/status',
+                text='自由空间路线预览 · execution_permitted=false · '+str(payload.get('status')),
+                position=tuple(points[0]) if len(points) else (0., 0., 0.)))
+
+    @_scene_locked
     def load_free_space(self, payload):
         """Render a hash-bound 2.5D sidecar as an offline evidence overlay."""
         self.clear('free_space')
@@ -317,6 +340,7 @@ class SceneController:
         from .free_space import CellState, free_space_from_payload
 
         grid = free_space_from_payload(payload)
+        self.free_space_grid = grid
         colors = {
             CellState.FREE: (60, 220, 120),
             CellState.OCCUPIED: (235, 70, 70),
@@ -438,6 +462,11 @@ class ViewerApplication(NavigationControls, PhotoSelectionControls, RouteWorkflo
         self._playback_ui()
         self._web_build_ui()
         self.navigation_panel = gui.add_folder('开始找物与方向引导', expand_by_default=True)
+        self.free_space_route_summary = gui.add_text(
+            '自由空间路线预览',
+            '加载自由空间 sidecar、目标支持点和当前定位后，可直接生成网格路线预览。',
+            multiline=True, disabled=True)
+        self._button('生成自由空间路线预览（不控制机器狗）', self._plan_free_space_route_preview)
         self.research_mode = gui.add_checkbox('显示研究模式与旧流程（人工起点、逐段审核、证据导入）', False)
         with gui.add_folder('新手先看：图中是什么？', expand_by_default=False):
             gui.add_markdown('**散点**：从多张照片估计的三维特征，不是完整墙面；没有点不代表没有障碍。\n\n'
@@ -751,6 +780,39 @@ class ViewerApplication(NavigationControls, PhotoSelectionControls, RouteWorkflo
         payload = read_json(path)
         self.controller.load_free_space(payload)
         self._message('已加载离线自由空间预览；execution_permitted=false，不会控制机器狗。')
+
+    def _plan_free_space_route_preview(self, _):
+        if not self.controller.model or self.controller.mode != 'final_map_replay':
+            raise ValueError('final_map_required: snapshot_alignment_not_established')
+        if self.controller.free_space_grid is None:
+            raise ValueError('请先在地图页加载与当前地图绑定的自由空间 sidecar。')
+        if not self.target_result:
+            raise ValueError('请先获得 supported 目标支持点。')
+        start = self.current_start
+        if start and start.get('T_MC') is not None:
+            start_pose = start['T_MC']
+            start_source = str(start.get('source') or 'localized_current_pose')
+        else:
+            # Normal workbench fallback: the selected historical reference is
+            # used as an offline preview origin; it is labelled as such and is
+            # never treated as a live robot pose.
+            camera = self._reference()
+            start_pose = camera['T_WC']
+            start_source = 'selected_reference_fallback_offline_only'
+        from .free_space_workflow import plan_free_space_from_workbench
+        payload = plan_free_space_from_workbench(
+            grid=self.controller.free_space_grid, model=self.controller.model,
+            target_result=self.target_result, start_pose=start_pose,
+            start_source=start_source)
+        path = self.sidecar / ('free_space_route-' + uuid4().hex + '.json')
+        atomic_json(path, payload)
+        self.controller.load_free_space_route(payload)
+        self.free_space_route_summary.value = (
+            f"状态：{payload['status']}；起点 {payload['start_cell']}；终点观察帧 "
+            f"{payload['goal_observation_camera']}；路径 {len(payload['path'])} 格\n"
+            f"来源：{payload['start_source']}\n保存：{path}\n"
+            "execution_permitted=false；终点是目标观察相机，不是物体中心。")
+        self._message('已生成自由空间路线预览，不会控制机器狗：' + str(path))
 
     def _return_map(self, event):
         self._pause_playback()

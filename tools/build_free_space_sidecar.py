@@ -14,7 +14,8 @@ import sys
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
-from go1loc.free_space import build_free_space_map, free_space_payload  # noqa: E402
+from go1loc.free_space import (build_free_space_map, free_space_payload,
+                               inflate_obstacles)  # noqa: E402
 
 
 def main(argv=None):
@@ -28,6 +29,10 @@ def main(argv=None):
     parser.add_argument("--ground-tolerance", type=float, default=0.08)
     parser.add_argument("--obstacle-height", type=float, default=0.30)
     parser.add_argument("--robot-radius", type=float, default=0.25)
+    parser.add_argument("--origin-x", type=float, default=0.0)
+    parser.add_argument("--origin-y", type=float, default=0.0)
+    parser.add_argument("--footprint-radius", type=float, default=None,
+                        help="inflate occupied cells by this measured radius")
     args = parser.parse_args(argv)
 
     scene_path = args.scene.resolve()
@@ -38,16 +43,20 @@ def main(argv=None):
         parser.error("scene identity/geometry fields missing: " + ", ".join(missing))
     grid = build_free_space_map(
         scene["points"], resolution=args.resolution,
+        origin=(args.origin_x, args.origin_y),
         ground_height=args.ground_height,
         ground_tolerance=args.ground_tolerance,
         obstacle_height=args.obstacle_height,
         robot_radius=args.robot_radius,
     )
+    if args.footprint_radius is not None:
+        grid = inflate_obstacles(grid, radius=args.footprint_radius)
     payload = free_space_payload(
         grid, map_id=scene["map_id"], map_hash=scene["map_hash"],
         component_id=scene["component_id"], units=scene["units"],
         scale_status=scene["scale_status"],
         geometry_source=f"scene_points:{scene_path.name}",
+        footprint_radius=args.footprint_radius,
     )
     payload["source_scene"] = str(scene_path)
     payload["source_scene_schema"] = scene.get("schema_version")

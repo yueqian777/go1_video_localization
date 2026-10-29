@@ -4,14 +4,17 @@ import unittest
 from go1loc.free_space import (
     CellState,
     build_free_space_map,
+    free_space_diagnostics,
     free_space_from_payload,
     free_space_payload,
+    inflate_obstacles,
 )
-from go1loc.grid_planner import plan_grid
+from go1loc.grid_planner import PlanningMode, plan_grid
 from go1loc.navigation_closed_loop import (
     ClosedLoopConfig,
     ClosedLoopNavigator,
     NavigationState,
+    PrimitivePhase,
     PoseObservation,
     Telemetry,
 )
@@ -65,6 +68,42 @@ class FreeSpaceTests(unittest.TestCase):
         self.assertEqual(payload["execution_permitted"], False)
         self.assertEqual(payload["map_hash"], "h")
 
+    def test_nonzero_origin_and_resolution_have_one_coordinate_contract(self):
+        result = build_free_space_map(
+            [[10.15, 20.05, 0.0], [10.25, 20.05, 0.0]],
+            resolution=0.1, origin=(10.0, 20.0), ground_height=0.0,
+        )
+        self.assertEqual(result.world_to_cell(10.15, 20.05), (1, 0))
+        self.assertEqual(result.world_to_cell(10.25, 20.05), (2, 0))
+        self.assertEqual(result.cell_to_world((1, 0)), (10.15, 20.05))
+        self.assertEqual(result.key(10.25, 20.05), (2, 0))
+
+    def test_footprint_inflation_blocks_a_cell_adjacent_to_obstacle(self):
+        grid = build_free_space_map(
+            ground_points([(x, 0) for x in (0, 1, 3, 4)]) + [[2.0, 0.0, 1.0]],
+            resolution=1.0, ground_height=0.0,
+        )
+        inflated = inflate_obstacles(grid, radius=1.0)
+        self.assertEqual(inflated.cell(1, 0).state, CellState.OCCUPIED)
+        self.assertIn("inflated_obstacle", inflated.cell(1, 0).evidence)
+
+    def test_diagnostics_marks_monocular_sidecar_preview_only(self):
+        grid = build_free_space_map(ground_points([(0, 0), (1, 0)]),
+                                    resolution=1.0, ground_height=0.0)
+        diagnostics = free_space_diagnostics(
+            grid, units="map_units", scale_status="arbitrary_monocular_scale",
+            footprint_radius=0.25)
+        self.assertTrue(diagnostics["preview_only"])
+        self.assertFalse(diagnostics["execution_geometry_ready"])
+        self.assertEqual(diagnostics["cell_counts"]["free"], 2)
+
+    def test_diagnostics_reports_unknown_hole_candidates(self):
+        ring = [(x, y) for x in range(3) for y in range(3) if (x, y) != (1, 1)]
+        grid = build_free_space_map(ground_points(ring), resolution=1.0, ground_height=0.0)
+        diagnostics = free_space_diagnostics(grid, units="m", scale_status="metric")
+        self.assertEqual(diagnostics["unknown_hole_components"], 1)
+        self.assertEqual(diagnostics["unknown_hole_cells"], 1)
+
 
 class GridPlannerTests(unittest.TestCase):
     def setUp(self):
@@ -112,9 +151,32 @@ class GridPlannerTests(unittest.TestCase):
         self.assertEqual(route.status, "no_path")
         self.assertIn("uncertain", route.reason)
 
+    def test_allow_unknown_never_allows_occupied_cell(self):
+        grid = build_free_space_map(
+            ground_points([(0, 0), (2, 0)]) + [[1.0, 0.0, 0.9]],
+            resolution=1.0, ground_height=0.0,
+        )
+        for mode in (PlanningMode.NORMAL, PlanningMode.EXPLORATION_CANDIDATE):
+            with self.subTest(mode=mode):
+                route = plan_grid(grid, (0, 0), (2, 0), planning_mode=mode)
+                if mode is PlanningMode.NORMAL:
+                    self.assertEqual(route.status, "no_path")
+                else:
+                    self.assertEqual(route.status, "exploration_candidate")
+                    self.assertTrue(route.requires_exploration)
+                self.assertNotIn((1, 0), [state[:2] for state in route.path])
+
+    def test_allow_unknown_uses_explicit_exploration_status(self):
+        grid = build_free_space_map(ground_points([(0, 0), (2, 0)]),
+                                    resolution=1.0, ground_height=0.0)
+        route = plan_grid(grid, (0, 0), (2, 0), planning_mode=PlanningMode.EXPLORATION_CANDIDATE)
+        self.assertEqual(route.status, "exploration_candidate")
+        self.assertTrue(route.requires_exploration)
+        self.assertIn("unknown", route.reason)
+
 
 class AdapterTests(unittest.TestCase):
-    class Link:
+    class Authority:
         def __init__(self):
             self.calls = []
             self.robot = {
@@ -129,41 +191,52 @@ class AdapterTests(unittest.TestCase):
             }
 
         def snapshot(self):
-            return {"connected": True, "robot": dict(self.robot)}
+            return {"connected": True, "robot_fresh": self.robot.get("robot_fresh", True),
+                    "robot": dict(self.robot)}
 
-        def submit(self, action, key="", **kwargs):
-            self.calls.append((action, key, kwargs))
-            return None
+        def authorize_navigation(self, task_id, token):
+            self.calls.append(("authorize", task_id, token))
+            return {"active": True}
+
+        def submit_navigation(self, task_id, token, command_id, primitive, ttl_s=None):
+            self.calls.append(("command", primitive, command_id))
+            return {"accepted": True, "command_id": command_id}
+
+        def stop_navigation(self, task_id, token, reason):
+            self.calls.append(("stop", reason))
+            return {"accepted": True, "primitive": "stop"}
+
+        def release_navigation(self, task_id, token):
+            self.calls.append(("release", task_id))
+            return {"accepted": True}
 
     def test_adapter_uses_existing_one_axis_protocol(self):
-        link = self.Link()
+        link = self.Authority()
         adapter = Go1RemoteControlAdapter(link, authorization_token="test")
         adapter.authorize_current_task("test")
         adapter.execute_motion_primitive("forward")
         adapter.execute_motion_primitive("turn_left")
         adapter.request_stop("test")
-        self.assertEqual([call[:2] for call in link.calls], [
-            ("heartbeat", "w"), ("heartbeat", "z"), ("heartbeat", ""),
-        ])
+        self.assertEqual([call[0] for call in link.calls], ["authorize", "command", "command", "stop"])
 
     def test_adapter_rejects_motion_without_authorization(self):
-        link = self.Link()
+        link = self.Authority()
         adapter = Go1RemoteControlAdapter(link, authorization_token="test")
         with self.assertRaises(PermissionError):
             adapter.execute_motion_primitive("forward")
 
     def test_adapter_uses_robotlink_top_level_freshness(self):
-        link = self.Link()
+        link = self.Authority()
         link.robot.pop("robot_fresh")
         original_snapshot = link.snapshot
         link.snapshot = lambda: {**original_snapshot(), "robot_fresh": True}
         adapter = Go1RemoteControlAdapter(link, authorization_token="test")
         adapter.authorize_current_task("test")
         adapter.execute_motion_primitive("forward")
-        self.assertEqual(link.calls[-1][0:2], ("heartbeat", "w"))
+        self.assertEqual(link.calls[-1][0], "command")
 
         link.snapshot = lambda: {**original_snapshot(), "robot_fresh": False}
-        with self.assertRaisesRegex(RuntimeError, "feedback"):
+        with self.assertRaisesRegex(RuntimeError, "session_lost"):
             adapter.execute_motion_primitive("forward")
 
 
@@ -235,6 +308,90 @@ class ClosedLoopTests(unittest.TestCase):
         command = navigator.step(self.observation(0), Telemetry(healthy=False, stopped=False, fault="STALE_STATE"), now=1.0)
         self.assertEqual(command.primitive, "stop")
         self.assertEqual(navigator.state, NavigationState.MOTION_FAULT)
+
+
+class ClosedLoopDeepRegressionTests(unittest.TestCase):
+    def setUp(self):
+        self.grid = build_free_space_map(
+            [[10.15, 20.05, 0.0], [10.25, 20.05, 0.0],
+             [10.15, 20.15, 0.0], [10.25, 20.15, 0.0]],
+            resolution=0.1, origin=(10.0, 20.0), ground_height=0.0,
+        )
+        self.config = ClosedLoopConfig(
+            metric_scale=True, camera_mount_verified=True, up_verified=True,
+            map_version="map-v1", max_command_age_s=1.0,
+        )
+
+    def obs(self, x, y, heading, frame, *, target_visible=False, quality=0.9):
+        return PoseObservation(
+            x=x, y=y, heading=heading, received_age_s=0.0, localized=True,
+            frame_id=frame, capture_session_id="session-a", source_sequence=int(frame[1:]),
+            source_time_s=float(int(frame[1:])), received_time_s=float(int(frame[1:])) + .01,
+            localization_time_s=float(int(frame[1:])) + .005, map_version="map-v1",
+            localization_quality=quality, target_visible=target_visible,
+        )
+
+    def test_same_frame_cannot_complete_forward_twice(self):
+        route = plan_grid(self.grid, (1, 0), (2, 0))
+        navigator = ClosedLoopNavigator(route, config=self.config, grid=self.grid)
+        navigator.prepare(); navigator.authorize()
+        first = navigator.step(self.obs(10.15, 20.05, "E", "f1"),
+                               Telemetry(True, True), now=0.0)
+        self.assertEqual(first.primitive, "forward")
+        repeated = navigator.step(self.obs(10.25, 20.05, "E", "f1", target_visible=True),
+                                  Telemetry(True, True, command_id=first.command_id,
+                                            motion_feedback="stopped"), now=.2)
+        self.assertIn(repeated.primitive, ("wait", "stop"))
+        self.assertEqual(navigator.index, 0)
+        confirmed = navigator.step(self.obs(10.25, 20.05, "E", "f2", target_visible=True),
+                                   Telemetry(True, True, command_id=first.command_id,
+                                             motion_feedback="stopped", feedback_time_s=.3), now=.3)
+        self.assertEqual(navigator.index, 1)
+        self.assertNotEqual(confirmed.primitive, "forward")
+
+    def test_turn_requires_new_frame_and_absolute_heading_before_next_action(self):
+        route = plan_grid(self.grid, (1, 0), (1, 1), start_heading="E")
+        navigator = ClosedLoopNavigator(route, config=self.config, grid=self.grid)
+        navigator.prepare(); navigator.authorize()
+        turn = navigator.step(self.obs(10.15, 20.05, "E", "f1"),
+                               Telemetry(True, True), now=0.0)
+        self.assertEqual(turn.primitive, "turn_left")
+        self.assertEqual(navigator.phase, PrimitivePhase.REQUESTED)
+        same_frame = navigator.step(self.obs(10.15, 20.05, "N", "f1"),
+                                    Telemetry(True, True, command_id=turn.command_id,
+                                              motion_feedback="stopped"), now=.2)
+        self.assertIn(same_frame.primitive, ("wait", "stop"))
+        self.assertEqual(navigator.index, 0)
+        confirmed = navigator.step(self.obs(10.15, 20.05, "N", "f2"),
+                                   Telemetry(True, True, command_id=turn.command_id,
+                                              motion_feedback="stopped", feedback_time_s=.3), now=.3)
+        self.assertEqual(navigator.index, 1)
+        self.assertNotEqual(confirmed.primitive, "turn_left")
+
+    def test_command_timeout_enters_replanning_without_consuming_action(self):
+        route = plan_grid(self.grid, (1, 0), (2, 0))
+        navigator = ClosedLoopNavigator(route, config=self.config, grid=self.grid)
+        navigator.prepare(); navigator.authorize()
+        command = navigator.step(self.obs(10.15, 20.05, "E", "f1"),
+                                 Telemetry(True, True), now=0.0)
+        stopped = navigator.step(self.obs(10.15, 20.05, "E", "f2"),
+                                 Telemetry(True, False, command_id=command.command_id,
+                                           motion_feedback="executing"), now=2.0)
+        self.assertEqual(stopped.primitive, "stop")
+        self.assertEqual(navigator.state, NavigationState.REPLANNING)
+        self.assertEqual(navigator.index, 0)
+
+    def test_goal_requires_target_observation_before_arrived(self):
+        route = plan_grid(self.grid, (1, 0), (2, 0))
+        navigator = ClosedLoopNavigator(route, config=self.config, grid=self.grid)
+        navigator.prepare(); navigator.authorize()
+        command = navigator.step(self.obs(10.15, 20.05, "E", "f1"),
+                                 Telemetry(True, True), now=0.0)
+        waiting = navigator.step(self.obs(10.25, 20.05, "E", "f2"),
+                                 Telemetry(True, True, command_id=command.command_id,
+                                           motion_feedback="stopped"), now=.3)
+        self.assertNotEqual(navigator.state, NavigationState.ARRIVED)
+        self.assertIn(waiting.primitive, ("wait", "stop"))
 
 
 class ScenarioTests(unittest.TestCase):
