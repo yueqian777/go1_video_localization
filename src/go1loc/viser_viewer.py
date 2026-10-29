@@ -301,6 +301,50 @@ class SceneController:
         if payload.get('goal_observation_pose') is not None:
             self.pose('goal', payload['goal_observation_pose'], color=(80, 230, 110))
 
+    @_scene_locked
+    def load_free_space(self, payload):
+        """Render a hash-bound 2.5D sidecar as an offline evidence overlay."""
+        self.clear('free_space')
+        if not self.model or self.mode != 'final_map_replay':
+            raise ValueError('snapshot_alignment_not_established')
+        if any(payload.get(key) != self.model.get(key) or not payload.get(key)
+               for key in ('map_id', 'map_hash', 'component_id')):
+            raise ValueError('free_space_map_mismatch')
+        if payload.get('execution_permitted') is not False:
+            raise ValueError('free_space_execution_contract_invalid')
+        if payload.get('units') != self.model.get('units'):
+            raise ValueError('free_space_units_mismatch')
+        from .free_space import CellState, free_space_from_payload
+
+        grid = free_space_from_payload(payload)
+        colors = {
+            CellState.FREE: (60, 220, 120),
+            CellState.OCCUPIED: (235, 70, 70),
+            CellState.UNKNOWN: (150, 150, 150),
+            CellState.UNCERTAIN: (245, 170, 40),
+        }
+        grouped = {state: [] for state in CellState}
+        for cell in grid.cells.values():
+            height = cell.ground_height if cell.ground_height is not None else 0.0
+            grouped[cell.state].append([
+                grid.origin_x + (cell.x + .5) * grid.resolution,
+                grid.origin_y + (cell.y + .5) * grid.resolution,
+                float(height),
+            ])
+        with self.server.atomic():
+            for state, points in grouped.items():
+                if points:
+                    self._keep('free_space', self.server.scene.add_point_cloud(
+                        '/free-space/' + state.value, points=np.asarray(points, dtype=float),
+                        colors=colors[state], point_size=max(.02, grid.resolution * .45)))
+            counts = payload.get('cell_counts', {})
+            text = '离线自由空间预览 · ' + ' / '.join(
+                f'{state.value}:{int(counts.get(state.value, len(grouped[state])))}'
+                for state in CellState)
+            self._keep('free_space', self.server.scene.add_label(
+                '/free-space/status', text=text, position=(0., 0., 0.)))
+        self.free_space = deepcopy(payload)
+
 
 def _app_locked(method):
     @wraps(method)
@@ -341,6 +385,7 @@ class ViewerApplication(NavigationControls, PhotoSelectionControls, RouteWorkflo
         self._pending_query = Path(query_dir) if query_dir else None
         self.plan_result = None
         self.target_result = None
+        self.free_space = None
         self.target_photo = None
         self.current_start = None
         self.live_reader_factory = live_reader_factory
@@ -411,6 +456,10 @@ class ViewerApplication(NavigationControls, PhotoSelectionControls, RouteWorkflo
                 hint='仅在「建图过程快照」模式使用；需要启动时已指定快照目录。')
             with gui.add_folder('高级：地图分量', expand_by_default=False):
                 self.component = gui.add_text('分量编号（留空使用第一个）', '')
+            self.free_space_path = gui.add_text(
+                '自由空间地图 sidecar（可选）', '',
+                hint='必须与当前地图的 map_id、map_hash、component_id 和 units 一致；仅离线预览。')
+            self._button('加载离线自由空间预览', self._load_free_space)
             self._button('加载所选地图或快照', self._load_mode)
             gui.add_markdown('查看位置照片、按视频顺序播放全程图片：请使用主面板上方的「地图照片与全程回放」，无需打开研究模式。')
             self._build_guide_ui()
@@ -694,6 +743,14 @@ class ViewerApplication(NavigationControls, PhotoSelectionControls, RouteWorkflo
                 'snapshot_index': int(self.snapshot_index.value), 'point_budget': POINT_BUDGET})
         else:
             self._submit('inspect_map', {'component_id': self.component.value.strip() or None})
+
+    def _load_free_space(self, _):
+        path = Path(self.free_space_path.value).expanduser().resolve()
+        if not path.is_file():
+            raise ValueError('free_space_sidecar_missing')
+        payload = read_json(path)
+        self.controller.load_free_space(payload)
+        self._message('已加载离线自由空间预览；execution_permitted=false，不会控制机器狗。')
 
     def _return_map(self, event):
         self._pause_playback()
