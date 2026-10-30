@@ -28,8 +28,8 @@
 
 - `src/go1loc/free_space.py`：2.5D栅格、证据分类、侧车序列化和加载。
 - `src/go1loc/grid_planner.py`：独立于历史路线图的带朝向 A*，支持前进、原地左右转和180°调头。
-- `src/go1loc/navigation_closed_loop.py`：尺度/相机安装/上方向门禁，以及“观察—一个原语—停止反馈—重新观察”的闭环骨架。
-- `src/go1loc/remote_control_adapter.py`：只调用现有 `RobotLink.submit()` 的适配器，不开第二个 SDK 端口。
+- `src/go1loc/navigation_closed_loop.py`：尺度/相机安装/上方向门禁、可恢复状态机、短时受限速度预测，以及连续同向前进段合并；不把角速度当绝对航向。
+- `src/go1loc/remote_control_adapter.py`：调用现有导航授权 API 和同一个 `RobotLink`，不打开第二个 SDK 端口；把真实反馈转换为执行中、实际停止、租约和人工接管状态。
 - `src/go1loc/offline_scenarios.py`：A–K离线场景和逐项结果。
 - `tools/build_free_space_sidecar.py`：从已有 `inspect_map` 的 `scene.json` 生成自由空间 sidecar。
 - `tools/run_navigation_scenarios.py`：生成 JSON 报告和 JSONL 事件日志。

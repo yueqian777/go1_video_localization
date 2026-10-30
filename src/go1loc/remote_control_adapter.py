@@ -2,7 +2,11 @@
 from __future__ import annotations
 
 import json
+import math
+import time
 import urllib.request
+
+from .navigation_closed_loop import Telemetry
 
 
 PRIMITIVE_KEYS = {
@@ -52,6 +56,15 @@ class NavigationHttpClient:
     def release_navigation(self, task_id, token):
         return self._request("/api/navigation/release", {"task_id": task_id})
 
+    def keepalive_navigation(self, task_id, token):
+        return self._request("/api/navigation/keepalive", {"task_id": task_id})
+
+    def pause_navigation(self, task_id, token, reason="visual_wait"):
+        return self._request("/api/navigation/pause", {"task_id": task_id, "reason": reason})
+
+    def resume_navigation(self, task_id, token):
+        return self._request("/api/navigation/resume", {"task_id": task_id})
+
 
 class Go1RemoteControlAdapter:
     def __init__(self, navigation_client, *, authorization_token: str,
@@ -65,6 +78,58 @@ class Go1RemoteControlAdapter:
 
     def snapshot(self):
         return self.client.snapshot()
+
+    @staticmethod
+    def telemetry_from_snapshot(snapshot: dict, *, expected_command_id: str | None = None) -> Telemetry:
+        """Convert receiver feedback into closed-loop telemetry.
+
+        ``actual_yaw`` is an angular rate from the Go1 state stream. It is
+        intentionally exposed only as ``actual_yaw_rate``; global heading is
+        still supplied by visual localization.
+        """
+        robot = snapshot.get("robot") or {}
+        navigation = snapshot.get("navigation") or {}
+        executing = robot.get("motion_executing")
+        stopped = robot.get("motion_stopped")
+        if stopped is None:
+            values = [robot.get("actual_vx"), robot.get("actual_vy"), robot.get("actual_yaw")]
+            stopped = (all(isinstance(value, (int, float)) and math.isfinite(value) for value in values)
+                       and math.hypot(float(values[0]), float(values[1])) < .05
+                       and abs(float(values[2])) < .05 and not executing)
+        if executing is True:
+            feedback = "executing"
+        elif stopped is True:
+            feedback = "stopped"
+        else:
+            feedback = robot.get("motion_feedback") or "accepted"
+        intent_id = navigation.get("motion_intent_command_id") or snapshot.get("navigation_command_id")
+        command_id = expected_command_id if expected_command_id == intent_id else intent_id
+        lease_remaining = navigation.get("lease_remaining_s")
+        lease_valid = (navigation.get("active") is True and
+                       isinstance(lease_remaining, (int, float)) and lease_remaining > 0)
+        if not navigation:
+            lease_valid = snapshot.get("connected") is True
+        actual_yaw_rate = robot.get("actual_yaw_rate", robot.get("actual_yaw"))
+        return Telemetry(
+            healthy=robot.get("health") == "OK",
+            stopped=bool(stopped),
+            fault=robot.get("fault_reason") if robot.get("fault") else None,
+            command_id=command_id,
+            motion_feedback=feedback,
+            feedback_time_s=time.monotonic(),
+            control_active=robot.get("control_active") is True,
+            armed=robot.get("armed") is True,
+            lease_valid=lease_valid,
+            manual_override=robot.get("remote_active") is True,
+            telemetry_time_s=time.monotonic() - float(snapshot.get("telemetry_age_ms", 0) or 0) / 1000,
+            actual_vx=robot.get("actual_vx"),
+            actual_vy=robot.get("actual_vy"),
+            actual_yaw_rate=actual_yaw_rate,
+            motion_executing=executing,
+            motion_stopped=bool(stopped),
+            navigation_active=navigation.get("active", True) is True,
+            navigation_paused=navigation.get("paused", False) is True,
+        )
 
     def authorize_current_task(self, token: str):
         if token != self.authorization_token:
@@ -111,6 +176,12 @@ class Go1RemoteControlAdapter:
         self.active_primitive = primitive
         return result
 
+    def execute_motion_action(self, action):
+        """Submit a closed-loop MotionAction with its bounded intent duration."""
+        return self.execute_motion_primitive(action.primitive,
+                                             command_id=action.command_id,
+                                             ttl_s=action.duration_s)
+
     def request_stop(self, reason: str = "navigation_stop"):
         if not self.authorized:
             raise PermissionError("navigation_authorization_required")
@@ -119,6 +190,32 @@ class Go1RemoteControlAdapter:
             raise RuntimeError("navigation_stop_not_accepted")
         self.active_primitive = None
         self.authorized = False
+        return result
+
+    def keepalive(self):
+        if not self.authorized:
+            raise PermissionError("navigation_authorization_required")
+        result = self.client.keepalive_navigation(self.task_id, self.authorization_token)
+        if not result or result.get("active") is not True:
+            raise RuntimeError("navigation_keepalive_not_accepted")
+        return result
+
+    def pause(self, reason: str = "visual_wait"):
+        if not self.authorized:
+            raise PermissionError("navigation_authorization_required")
+        result = self.client.pause_navigation(self.task_id, self.authorization_token, reason)
+        if not result or result.get("paused") is not True:
+            raise RuntimeError("navigation_pause_not_accepted")
+        self.active_primitive = None
+        return result
+
+    def resume(self):
+        if not self.authorized:
+            raise PermissionError("navigation_authorization_required")
+        result = self.client.resume_navigation(self.task_id, self.authorization_token)
+        if not result or result.get("active") is not True or result.get("paused") is True:
+            raise RuntimeError("navigation_resume_not_accepted")
+        self.active_primitive = None
         return result
 
     def release_control(self):

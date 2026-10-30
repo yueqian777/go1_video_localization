@@ -90,6 +90,9 @@ def _simulate_closed_loop(grid, start, goal, *, heading="E", stale_age=None,
         if navigator.state in {NavigationState.STOPPED, NavigationState.MOTION_FAULT}:
             events.append(delayed.primitive)
             break
+        if navigator.state is NavigationState.WAIT_RELOCALIZATION:
+            events.append(delayed.primitive)
+            break
         now += 0.2
         if not feedback_stopped:
             events.append(delayed.primitive)
@@ -176,9 +179,9 @@ def _scenario_g():
     route, events, state = _simulate_closed_loop(grid, (0, 0), (2, 0), stale_age=2.0)
     assert route.status == "planned"
     assert events[-1] == "stop"
-    assert state == NavigationState.STOPPED
+    assert state == NavigationState.WAIT_RELOCALIZATION
     return {"new_route": False, "reverse_route": False, "events": events,
-            "path_length_cells": len(route.path), "result": "stale_pose_stop"}
+            "path_length_cells": len(route.path), "result": "stale_pose_wait_relocalization"}
 
 
 def _scenario_h():
@@ -208,11 +211,11 @@ def _scenario_i():
     delayed = navigator.step(PoseObservation(0, 0, "E", 0, True),
                              Telemetry(True, False), now=.3)
     assert first.primitive == "forward"
-    assert delayed.primitive == "stop"
-    assert navigator.state == NavigationState.STOPPED
+    assert delayed.primitive == "wait"
+    assert navigator.state == NavigationState.MOVING_SEGMENT
     return {"new_route": False, "reverse_route": False,
             "events": [first.primitive, "feedback_delayed", delayed.primitive],
-            "path_length_cells": len(route.path), "result": "ttl_and_startup_delay_stop"}
+            "path_length_cells": len(route.path), "result": "feedback_delay_keeps_action_in_flight"}
 
 
 def _scenario_j():

@@ -25,6 +25,8 @@ class MotionAction:
     cell: tuple[int, int] | None = None
     target_heading: str | None = None
     command_id: str | None = None
+    distance_cells: int = 1
+    duration_s: float | None = None
 
 
 @dataclass

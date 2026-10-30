@@ -9,7 +9,7 @@ from go1loc.free_space import (
     free_space_payload,
     inflate_obstacles,
 )
-from go1loc.grid_planner import PlanningMode, plan_grid
+from go1loc.grid_planner import MotionAction, PlanningMode, plan_grid
 from go1loc.navigation_closed_loop import (
     ClosedLoopConfig,
     ClosedLoopNavigator,
@@ -17,6 +17,7 @@ from go1loc.navigation_closed_loop import (
     PrimitivePhase,
     PoseObservation,
     Telemetry,
+    predict_pose,
 )
 from go1loc.remote_control_adapter import Go1RemoteControlAdapter
 
@@ -174,6 +175,16 @@ class GridPlannerTests(unittest.TestCase):
         self.assertTrue(route.requires_exploration)
         self.assertIn("unknown", route.reason)
 
+    def test_long_straight_route_is_coalesced_by_closed_loop(self):
+        route = plan_grid(self.grid, (0, 1), (4, 1), start_heading="E")
+        navigator = ClosedLoopNavigator(
+            route,
+            config=ClosedLoopConfig(metric_scale=True, camera_mount_verified=True,
+                                    up_verified=True),
+        )
+        self.assertEqual([action.primitive for action in navigator.route.actions], ["forward", "forward"])
+        self.assertEqual(navigator.route.actions[0].distance_cells, 3)
+
 
 class AdapterTests(unittest.TestCase):
     class Authority:
@@ -199,7 +210,7 @@ class AdapterTests(unittest.TestCase):
             return {"active": True}
 
         def submit_navigation(self, task_id, token, command_id, primitive, ttl_s=None):
-            self.calls.append(("command", primitive, command_id))
+            self.calls.append(("command", primitive, command_id, ttl_s))
             return {"accepted": True, "command_id": command_id}
 
         def stop_navigation(self, task_id, token, reason):
@@ -239,6 +250,31 @@ class AdapterTests(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "session_lost"):
             adapter.execute_motion_primitive("forward")
 
+    def test_adapter_converts_feedback_without_treating_yaw_rate_as_heading(self):
+        link = self.Authority()
+        link.snapshot = lambda: {
+            "connected": True, "robot_fresh": True, "telemetry_age_ms": 40,
+            "robot": {"health": "OK", "control_active": True, "armed": True,
+                      "motion_executing": True, "motion_stopped": False,
+                      "actual_vx": .2, "actual_vy": .01, "actual_yaw": .3,
+                      "actual_yaw_is_rate": True},
+            "navigation": {"active": True, "paused": False, "lease_remaining_s": 2.0},
+        }
+        adapter = Go1RemoteControlAdapter(link, authorization_token="test")
+        telemetry = adapter.telemetry_from_snapshot(adapter.snapshot(), expected_command_id="cmd-1")
+        self.assertFalse(telemetry.stopped)
+        self.assertEqual(telemetry.actual_yaw_rate, .3)
+        self.assertFalse(hasattr(telemetry, "heading"))
+
+    def test_adapter_uses_action_duration_as_real_intent_ttl(self):
+        link = self.Authority()
+        adapter = Go1RemoteControlAdapter(link, authorization_token="test")
+        adapter.authorize_current_task("test")
+        adapter.execute_motion_action(MotionAction("forward", command_id="cmd-duration",
+                                                   duration_s=.9))
+        self.assertEqual(link.calls[-1][0], "command")
+        self.assertEqual(link.calls[-1][-1], .9)
+
 
 class ClosedLoopTests(unittest.TestCase):
     def setUp(self):
@@ -252,7 +288,8 @@ class ClosedLoopTests(unittest.TestCase):
     def test_closed_loop_emits_segment_then_waits_for_observation(self):
         navigator = ClosedLoopNavigator(
             self.route,
-            config=ClosedLoopConfig(metric_scale=True, camera_mount_verified=True, up_verified=True),
+            config=ClosedLoopConfig(metric_scale=True, camera_mount_verified=True, up_verified=True,
+                                    max_forward_cells=1),
         )
         navigator.prepare()
         navigator.authorize()
@@ -265,14 +302,97 @@ class ClosedLoopTests(unittest.TestCase):
     def test_stale_pose_requests_stop_and_never_renews_motion(self):
         navigator = ClosedLoopNavigator(
             self.route,
-            config=ClosedLoopConfig(metric_scale=True, camera_mount_verified=True, up_verified=True),
+            config=ClosedLoopConfig(metric_scale=True, camera_mount_verified=True, up_verified=True,
+                                    max_forward_cells=1),
         )
         navigator.prepare()
         navigator.authorize()
         navigator.step(self.observation(0), Telemetry(healthy=True, stopped=True), now=0.0)
         command = navigator.step(self.observation(0, age=2.0), Telemetry(healthy=True, stopped=False), now=1.0)
-        self.assertEqual(navigator.state, NavigationState.STOPPED)
+        self.assertEqual(navigator.state, NavigationState.WAIT_RELOCALIZATION)
         self.assertEqual(command.primitive, "stop")
+
+    def test_visual_recovery_requires_new_route_and_does_not_resume_old_action(self):
+        navigator = ClosedLoopNavigator(
+            self.route,
+            config=ClosedLoopConfig(metric_scale=True, camera_mount_verified=True,
+                                    up_verified=True, max_forward_cells=1),
+        )
+        navigator.prepare(); navigator.authorize()
+        first = navigator.step(self.observation(0), Telemetry(True, True), now=0.0)
+        waiting = navigator.step(self.observation(0, age=2.0), Telemetry(True, False), now=1.0)
+        self.assertEqual(waiting.primitive, "stop")
+        self.assertEqual(navigator.state, NavigationState.WAIT_RELOCALIZATION)
+        recovered = self.observation(1)
+        self.assertEqual(navigator.step(recovered, Telemetry(True, True), now=1.2).primitive, "wait")
+        self.assertEqual(navigator.state, NavigationState.RESUMING)
+        replanned = plan_grid(self.grid, (1, 0), (3, 0), start_heading="E")
+        navigator.resume_with_route(replanned, recovered)
+        next_command = navigator.step(recovered, Telemetry(True, True), now=1.3)
+        self.assertEqual(next_command.primitive, "forward")
+        self.assertNotEqual(next_command.command_id, first.command_id)
+
+    def test_visual_intervals_have_recoverable_compatibility_behavior(self):
+        for interval in (.5, 1.0, 2.0, 3.0):
+            with self.subTest(interval=interval):
+                navigator = ClosedLoopNavigator(
+                    self.route,
+                    config=ClosedLoopConfig(metric_scale=True, camera_mount_verified=True,
+                                            up_verified=True, max_forward_cells=1),
+                )
+                navigator.prepare(); navigator.authorize()
+                first = navigator.step(self.observation(0), Telemetry(True, True), now=0.0)
+                navigator.step(self.observation(0, age=interval),
+                               Telemetry(True, False, command_id=first.command_id,
+                                         motion_feedback="executing"), now=interval)
+                if interval <= .75:
+                    self.assertEqual(navigator.state, NavigationState.MOVING_SEGMENT)
+                else:
+                    self.assertEqual(navigator.state, NavigationState.WAIT_RELOCALIZATION)
+
+    def test_executing_feedback_does_not_become_terminal_stopped(self):
+        navigator = ClosedLoopNavigator(
+            self.route,
+            config=ClosedLoopConfig(metric_scale=True, camera_mount_verified=True,
+                                    up_verified=True, max_forward_cells=1),
+        )
+        navigator.prepare(); navigator.authorize()
+        first = navigator.step(self.observation(0), Telemetry(True, True), now=0.0)
+        result = navigator.step(
+            self.observation(0), Telemetry(True, False, command_id=first.command_id,
+                                           motion_feedback="executing"), now=.2)
+        self.assertEqual(result.primitive, "wait")
+        self.assertEqual(navigator.state, NavigationState.MOVING_SEGMENT)
+
+    def test_pause_and_resume_keep_task_but_clear_motion_intent(self):
+        navigator = ClosedLoopNavigator(
+            self.route,
+            config=ClosedLoopConfig(metric_scale=True, camera_mount_verified=True,
+                                    up_verified=True, max_forward_cells=1),
+        )
+        navigator.prepare(); navigator.authorize()
+        navigator.step(self.observation(0), Telemetry(True, True), now=0.0)
+        self.assertEqual(navigator.pause("obstacle_wait").primitive, "stop")
+        self.assertEqual(navigator.state, NavigationState.PAUSED)
+        self.assertEqual(navigator.step(self.observation(0), Telemetry(True, True), now=.5).primitive, "stop")
+        self.assertEqual(navigator.resume(self.observation(0), Telemetry(True, True)).primitive, "wait")
+        self.assertEqual(navigator.state, NavigationState.RESUMING)
+
+    def test_pose_prediction_is_bounded_and_keeps_yaw_rate_separate(self):
+        observation = self.observation(0)
+        predicted = predict_pose(
+            observation,
+            Telemetry(True, False, actual_vx=1.0, actual_vy=0.0,
+                      actual_yaw_rate=.4),
+            elapsed_s=.25,
+            max_elapsed_s=.5,
+        )
+        self.assertAlmostEqual(predicted.x, .25)
+        self.assertEqual(predicted.heading, "E")
+        self.assertAlmostEqual(predicted.heading_delta_rad, .1)
+        with self.assertRaises(ValueError):
+            predict_pose(observation, Telemetry(True, False, actual_vx=1.0),
+                         elapsed_s=.6, max_elapsed_s=.5)
 
     def test_bad_scale_blocks_authorized_motion(self):
         navigator = ClosedLoopNavigator(
@@ -287,7 +407,8 @@ class ClosedLoopTests(unittest.TestCase):
     def test_manual_override_stops_and_cannot_resume_old_command(self):
         navigator = ClosedLoopNavigator(
             self.route,
-            config=ClosedLoopConfig(metric_scale=True, camera_mount_verified=True, up_verified=True),
+            config=ClosedLoopConfig(metric_scale=True, camera_mount_verified=True, up_verified=True,
+                                    max_forward_cells=1),
         )
         navigator.prepare()
         navigator.authorize()
@@ -300,7 +421,8 @@ class ClosedLoopTests(unittest.TestCase):
     def test_feedback_fault_stops_without_declaring_arrival(self):
         navigator = ClosedLoopNavigator(
             self.route,
-            config=ClosedLoopConfig(metric_scale=True, camera_mount_verified=True, up_verified=True),
+            config=ClosedLoopConfig(metric_scale=True, camera_mount_verified=True, up_verified=True,
+                                    max_forward_cells=1),
         )
         navigator.prepare()
         navigator.authorize()
@@ -409,7 +531,7 @@ class ScenarioTests(unittest.TestCase):
         report = run_all_scenarios()
         scenario = next(row for row in report["scenarios"] if row["id"] == "I")
         self.assertEqual(scenario["status"], "pass")
-        self.assertIn("stop", scenario["events"])
+        self.assertIn("wait", scenario["events"])
 
 
 

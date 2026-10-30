@@ -59,7 +59,14 @@ results/navigation_upgrade_20261029/deep_fix_real_evidence_audit.json
 - lease 过期、状态不新鲜、重复 command_id 或网页 STOP/DISARM/disconnect/release 会停止并撤销导航所有权；
 - `NavigationHttpClient` 是主仓库闭环到远程服务的接口。
 
-具体接口和配置见远程仓库的 `NAVIGATION_AUTHORITY.md`。
+具体接口和配置见远程仓库的 `NAVIGATION_AUTHORITY.md`。自动导航的任务租约、运动意图有效期、浏览器按键租约、网络新鲜度和接收端 MOVE TTL 已拆分；视觉短暂丢帧进入 `WAIT_RELOCALIZATION`，显式暂停进入 `PAUSED`，恢复先进入 `RESUMING`，必须以当前位姿重新生成路线后才会再次发出非零动作。
+
+## 本轮集成修改与边界
+
+- 连续同向前进格子按 `max_forward_cells` 合并，默认最多 3 格；转角、路径断点和障碍区域仍保留独立动作。A* 主干没有修改。
+- `Telemetry` 明确区分 command id、执行中、实际停止、遥测时间、导航租约、人工接管、实际速度和 yaw 角速度。`predict_pose()` 只在不超过 0.5 秒的窗口内使用机身速度补齐短空缺，绝不把 `actual_yaw` 改写成绝对朝向，也不替代视觉全局修正。
+- `NavigationHttpClient` 增加 keepalive/pause/resume；暂停不保留非零意图，恢复不会重放旧 command。真实控制链仍没有自动 TAKE、ARM 或第二套 SDK。
+- 远程仓库的 `tests/test_cross_repo_navigation.py` 使用原生模拟接收端、PC 服务和本仓库HTTP客户端验证授权—运动反馈—暂停—恢复—新动作—停止链路，并验证动作截止后不会继续续发。
 
 ## 验证结果
 
@@ -70,7 +77,7 @@ tools/run_tests.ps1
 Ran 613 tests ... OK
 ```
 
-新增自由空间和闭环回归共 30 项通过，A–K 离线场景全部通过，`motion_commands_sent=false`。
+新增自由空间和闭环回归共 37 项通过，A–K 离线场景全部通过，`motion_commands_sent=false`。控制仓库相关回归及跨仓库模拟集成共 12 项通过；MSYS2 下控制策略测试通过。
 
 远程控制仓库在 MSYS2 g++ 模拟接收端下：
 
