@@ -1,0 +1,8 @@
+build*/
+config/*.json
+config/*.token
+__pycache__/
+*.py[cod]
+*.log
+output/
+.playwright-cli/
