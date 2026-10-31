@@ -8,7 +8,9 @@ from http.server import ThreadingHTTPServer
 import threading
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
-VISION = ROOT.parent.parent / "go1_video_localization"
+_workspace_candidates = (ROOT.parent.parent / "go1_video_localization", ROOT.parent.parent)
+VISION = next((candidate for candidate in _workspace_candidates
+               if (candidate / "src" / "go1loc").is_dir()), ROOT.parent.parent)
 sys.path.insert(0, str(ROOT / "tests"))
 sys.path.insert(0, str(ROOT / "pc"))
 sys.path.insert(0, str(VISION / "src"))

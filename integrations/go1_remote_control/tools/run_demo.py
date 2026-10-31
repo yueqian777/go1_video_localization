@@ -2,12 +2,14 @@
 import argparse
 import os
 import pathlib
+import shlex
 import shutil
 import socket
 import subprocess
 import sys
 import tempfile
 import time
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
 from create_pairing import create
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
@@ -20,14 +22,23 @@ def build_simulator():
     build = ROOT / 'build'
     build.mkdir(exist_ok=True)
     binary = build / ('go1_receiver_sim.exe' if os.name == 'nt' else 'go1_receiver_sim')
-    command = [compiler, '-std=c++14', '-Wall', '-Wextra', '-Wpedantic', '-Werror', '-DGO1_SIM_ONLY',
-               'robot/receiver.cpp', '-o', 'build/'+binary.name]
     if os.name == 'nt':
-        command.append('-lws2_32')
+        bash = pathlib.Path(r'C:\msys64\usr\bin\bash.exe')
+        if not bash.is_file():
+            bash = pathlib.Path(shutil.which('bash') or '')
+        if not bash.is_file():
+            raise RuntimeError('需要 MSYS2 Bash 编译离线接收端')
+        unix_root = '/' + ROOT.drive[0].lower() + ROOT.as_posix()[2:]
+        compile_command = (
+            f"export PATH=/mingw64/bin:/usr/bin:$PATH; cd {shlex.quote(unix_root)}; "
+            f"g++ -std=c++14 -Wall -Wextra -Wpedantic -Werror -DGO1_SIM_ONLY "
+            f"robot/receiver.cpp -o build/{shlex.quote(binary.name)} -lws2_32"
+        )
+        subprocess.run([str(bash), '-lc', compile_command], check=True)
     else:
-        command.append('-pthread')
-    # Relative compiler paths avoid MinGW linker issues with the Chinese workspace path on Windows.
-    subprocess.run(command, check=True, cwd=ROOT)
+        command = [compiler, '-std=c++14', '-Wall', '-Wextra', '-Wpedantic', '-Werror', '-DGO1_SIM_ONLY',
+                   'robot/receiver.cpp', '-o', 'build/'+binary.name, '-pthread']
+        subprocess.run(command, check=True, cwd=ROOT)
     return binary
 
 
@@ -42,7 +53,7 @@ def main():
         with socket.socket() as probe:
             probe.bind(('127.0.0.1', 0))
             receiver_port = probe.getsockname()[1]
-        config, token = create(pathlib.Path(temporary), '127.0.0.1', receiver_port, True)
+        config, token, _navigation_token = create(pathlib.Path(temporary), '127.0.0.1', receiver_port, True)
         hidden = subprocess.CREATE_NO_WINDOW if os.name == 'nt' else 0
         receiver_args = [str(binary), '--simulate', '--port', str(receiver_port), '--token-file', str(token)]
         if args.mock_cross_drift:

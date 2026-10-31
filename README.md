@@ -2,6 +2,10 @@
 
 基于 Go1 运动视频建图的照片目标定位系统。项目运行在外部计算机，默认只处理本地文件，不连接机器狗，不修改现有 `go1_hri` 控制栈。
 
+## Go1 统一导航入口
+
+视觉定位和远程控制已经合并到同一仓库。控制端位于 `integrations/go1_remote_control`，双击 `start_go1_simulation.cmd` 可打开只使用本机模拟接收端的控制页面；双击 `start_go1_navigation.cmd` 可启动默认 SHADOW Runner。完整操作和验证命令见[统一导航入口说明](README_UNIFIED_GO1_NAVIGATION_zh.md)。
+
 ## 当前状态与阅读顺序（2026-10-17）
 
 下文按日期保留的“缺少真实视频”等内容是早期实验状态，不是当前输入清单。
