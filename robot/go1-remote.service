@@ -1,0 +1,19 @@
+[Unit]
+Description=Go1 authenticated LAN receiver (monitor-only until operator takeover)
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/home/pi/go1_remote_control
+ExecStart=/home/pi/go1_remote_control/build/go1_receiver --live --bind 192.168.12.1 --port 8765 --token-file /home/pi/go1_remote_control/config/robot.token
+Restart=on-failure
+RestartSec=3
+KillSignal=SIGTERM
+TimeoutStopSec=5
+UMask=0077
+# Initial deployment matches the legacy sudo demo and its root-owned SDK lock file.
+# Do not enable/install this service before completing the real-hardware acceptance.
+
+[Install]
+WantedBy=multi-user.target
