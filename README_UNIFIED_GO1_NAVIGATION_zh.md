@@ -8,6 +8,7 @@ go1_video_localization/
 ├─ integrations/go1_remote_control/    PC 控制服务、模拟接收端和控制测试
 ├─ start_go1_navigation.cmd             默认 SHADOW 启动
 ├─ start_go1_simulation.cmd             离线模拟控制页面
+├─ run_go1_tests.cmd                    双击运行统一模拟测试
 └─ tools/run_unified_navigation_tests.ps1  一键编译并运行跨仓库模拟测试
 ```
 
@@ -21,6 +22,8 @@ go1_video_localization/
 cd "D:\文档\ChatGPT\共身智能\go1_video_localization"
 & .\tools\run_unified_navigation_tests.ps1
 ```
+
+也可以直接双击项目根目录的 `run_go1_tests.cmd`。
 
 它会编译模拟接收端，然后运行视觉闭环、Runner、导航权限和跨仓库 HTTP 测试。默认不会连接真实机器狗。
 
