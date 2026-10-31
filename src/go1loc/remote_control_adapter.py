@@ -89,6 +89,7 @@ class Go1RemoteControlAdapter:
         """
         robot = snapshot.get("robot") or {}
         navigation = snapshot.get("navigation") or {}
+        feedback_record = snapshot.get("navigation_feedback") or {}
         executing = robot.get("motion_executing")
         stopped = robot.get("motion_stopped")
         if stopped is None:
@@ -96,32 +97,47 @@ class Go1RemoteControlAdapter:
             stopped = (all(isinstance(value, (int, float)) and math.isfinite(value) for value in values)
                        and math.hypot(float(values[0]), float(values[1])) < .05
                        and abs(float(values[2])) < .05 and not executing)
-        if executing is True:
+        receiver_sequence = feedback_record.get("receiver_command_sequence")
+        send_sequence = feedback_record.get("move_send_sequence")
+        sequence_matches = (isinstance(send_sequence, int)
+                            and receiver_sequence == send_sequence)
+        if executing is True and sequence_matches:
             feedback = "executing"
-        elif stopped is True:
+        elif stopped is True and sequence_matches:
             feedback = "stopped"
         else:
-            feedback = robot.get("motion_feedback") or "accepted"
-        intent_id = navigation.get("motion_intent_command_id") or snapshot.get("navigation_command_id")
-        command_id = expected_command_id if expected_command_id == intent_id else intent_id
+            feedback = "accepted"
+        intent_id = feedback_record.get("command_id")
+        command_id = intent_id
         lease_remaining = navigation.get("lease_remaining_s")
         lease_valid = (navigation.get("active") is True and
                        isinstance(lease_remaining, (int, float)) and lease_remaining > 0)
         if not navigation:
             lease_valid = snapshot.get("connected") is True
         actual_yaw_rate = robot.get("actual_yaw_rate", robot.get("actual_yaw"))
+        started_time = feedback_record.get("motion_started_time_s")
+        stopped_time = feedback_record.get("motion_stopped_time_s")
+        feedback_time = (feedback_record.get("receiver_ack_time_s")
+                         or feedback_record.get("status_received_time_s"))
+        causal_feedback = bool(
+            feedback_record.get("causal_feedback") is True
+            and sequence_matches
+            and feedback_record.get("receiver_ack_sequence") == send_sequence
+            and (expected_command_id is None or intent_id == expected_command_id)
+        )
         return Telemetry(
             healthy=robot.get("health") == "OK",
             stopped=bool(stopped),
             fault=robot.get("fault_reason") if robot.get("fault") else None,
             command_id=command_id,
             motion_feedback=feedback,
-            feedback_time_s=time.monotonic(),
+            feedback_time_s=feedback_time,
             control_active=robot.get("control_active") is True,
             armed=robot.get("armed") is True,
             lease_valid=lease_valid,
             manual_override=robot.get("remote_active") is True,
-            telemetry_time_s=time.monotonic() - float(snapshot.get("telemetry_age_ms", 0) or 0) / 1000,
+            telemetry_time_s=feedback_record.get("status_received_time_s")
+            or snapshot.get("status_received_time_s"),
             actual_vx=robot.get("actual_vx"),
             actual_vy=robot.get("actual_vy"),
             actual_yaw_rate=actual_yaw_rate,
@@ -129,6 +145,20 @@ class Go1RemoteControlAdapter:
             motion_stopped=bool(stopped),
             navigation_active=navigation.get("active", True) is True,
             navigation_paused=navigation.get("paused", False) is True,
+            command_created_time_s=feedback_record.get("command_created_time_s"),
+            intent_accepted_time_s=feedback_record.get("intent_accepted_time_s"),
+            move_sent_time_s=feedback_record.get("move_sent_time_s"),
+            receiver_ack_time_s=feedback_record.get("receiver_ack_time_s"),
+            motion_started_time_s=started_time,
+            motion_stopped_time_s=stopped_time,
+            send_sequence=send_sequence,
+            receiver_command_sequence=receiver_sequence,
+            receiver_clock_id=feedback_record.get("receiver_clock_id"),
+            feedback_clock_id=feedback_record.get("feedback_clock_id"),
+            time_uncertainty_s=(float(feedback_record.get("time_uncertainty_s"))
+                                if isinstance(feedback_record.get("time_uncertainty_s"), (int, float))
+                                else float("inf")),
+            causal_feedback=causal_feedback,
         )
 
     def authorize_current_task(self, token: str):

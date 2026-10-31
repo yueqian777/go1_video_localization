@@ -39,7 +39,7 @@ def _simulate_closed_loop(grid, start, goal, *, heading="E", stale_age=None,
                                 up_verified=True),
     )
     navigator.prepare()
-    navigator.authorize()
+    navigator.authorize(shadow=True)
     x, y = start
     current_heading = heading
     source_sequence = 0
@@ -56,7 +56,9 @@ def _simulate_closed_loop(grid, start, goal, *, heading="E", stale_age=None,
                                source_sequence=source_sequence,
                                source_time_s=now, received_time_s=now,
                                localization_time_s=now, map_version="offline-map",
-                               localization_quality=1.0, target_visible=target_visible)
+                               localization_quality=1.0, target_visible=target_visible,
+                               capture_time_s=now, capture_clock_id="offline-clock",
+                               capture_time_uncertainty_s=.01)
 
     for _ in range(256):
         # A new visual frame is required before issuing a subsequent action.
@@ -83,7 +85,12 @@ def _simulate_closed_loop(grid, start, goal, *, heading="E", stale_age=None,
         # displacement is applied at command issuance or at this intermediate tick.
         telemetry = Telemetry(True, feedback_stopped, motion_feedback=(
             "stopped" if feedback_stopped else "executing"),
-            command_id=pending.command_id, feedback_time_s=now)
+            command_id=pending.command_id, feedback_time_s=now,
+            motion_started_time_s=now-.1 if feedback_stopped else None,
+            motion_stopped_time_s=now if feedback_stopped else None,
+            send_sequence=1, receiver_command_sequence=1,
+            feedback_clock_id="offline-clock", time_uncertainty_s=.01,
+            causal_feedback=feedback_stopped)
         delayed = navigator.step(observation(age), telemetry, now=now)
         if delayed.primitive not in {"wait", "stop"}:
             events.append(delayed.primitive)
@@ -105,8 +112,14 @@ def _simulate_closed_loop(grid, start, goal, *, heading="E", stale_age=None,
         elif pending.primitive == "forward" and pending.cell is not None:
             x, y = pending.cell
         source_sequence += 1
+        now += 0.1
         telemetry = Telemetry(True, True, motion_feedback="stopped",
-                              command_id=pending.command_id, feedback_time_s=now)
+                              command_id=pending.command_id, feedback_time_s=now,
+                              motion_started_time_s=now-.2,
+                              motion_stopped_time_s=now-.1,
+                              send_sequence=1, receiver_command_sequence=1,
+                              feedback_clock_id="offline-clock", time_uncertainty_s=.01,
+                              causal_feedback=True)
         confirmed = navigator.step(observation(), telemetry, now=now)
         events.append(confirmed.primitive)
         pending = None
@@ -189,7 +202,7 @@ def _scenario_h():
     route = plan_grid(grid, (0, 0), (2, 0))
     navigator = ClosedLoopNavigator(route, config=ClosedLoopConfig(True, True, True))
     navigator.prepare()
-    navigator.authorize()
+    navigator.authorize(shadow=True)
     navigator.manual_override("operator_stop")
     command = navigator.step(PoseObservation(0, 0, "E", 0, True),
                              Telemetry(True, True), now=0)
@@ -205,7 +218,7 @@ def _scenario_i():
     route = plan_grid(grid, (0, 0), (2, 0))
     navigator = ClosedLoopNavigator(route, config=ClosedLoopConfig(True, True, True))
     navigator.prepare()
-    navigator.authorize()
+    navigator.authorize(shadow=True)
     first = navigator.step(PoseObservation(0, 0, "E", 0, True),
                            Telemetry(True, True), now=0)
     delayed = navigator.step(PoseObservation(0, 0, "E", 0, True),
@@ -238,7 +251,7 @@ def _scenario_k():
     route = plan_grid(grid, (0, 0), (0, 0))
     navigator = ClosedLoopNavigator(route, config=ClosedLoopConfig(True, True, True))
     navigator.prepare()
-    navigator.authorize()
+    navigator.authorize(shadow=True)
     command = navigator.step(PoseObservation(0, 0, "E", 0, True),
                              Telemetry(True, True), now=0)
     assert navigator.state == NavigationState.ARRIVED

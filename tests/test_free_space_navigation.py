@@ -283,7 +283,18 @@ class ClosedLoopTests(unittest.TestCase):
         self.route = plan_grid(self.grid, (0, 0), (3, 0), start_heading="E")
 
     def observation(self, x, heading="E", age=0.0):
-        return PoseObservation(x=x, y=0.0, heading=heading, received_age_s=age, localized=True)
+        return PoseObservation(x=x, y=0.0, heading=heading, received_age_s=age, localized=True,
+                               capture_time_s=10.0, capture_clock_id="sim-clock",
+                               capture_time_uncertainty_s=.01)
+
+    def proof(self, command_id, *, stopped=True, stop_time=2.0):
+        return Telemetry(True, stopped, command_id=command_id,
+                         motion_feedback="stopped" if stopped else "executing",
+                         feedback_time_s=stop_time, motion_started_time_s=1.0,
+                         motion_stopped_time_s=stop_time if stopped else None,
+                         send_sequence=7, receiver_command_sequence=7,
+                         feedback_clock_id="sim-clock", time_uncertainty_s=.01,
+                         causal_feedback=True)
 
     def test_closed_loop_emits_segment_then_waits_for_observation(self):
         navigator = ClosedLoopNavigator(
@@ -292,11 +303,11 @@ class ClosedLoopTests(unittest.TestCase):
                                     max_forward_cells=1),
         )
         navigator.prepare()
-        navigator.authorize()
+        navigator.authorize(shadow=True)
         command = navigator.step(self.observation(0), Telemetry(healthy=True, stopped=True), now=0.0)
         self.assertEqual(navigator.state, NavigationState.MOVING_SEGMENT)
         self.assertEqual(command.primitive, "forward")
-        navigator.step(self.observation(1), Telemetry(healthy=True, stopped=True), now=1.0)
+        navigator.step(self.observation(1), self.proof(command.command_id), now=1.0)
         self.assertEqual(navigator.state, NavigationState.WAITING_FOR_OBSERVATION)
 
     def test_stale_pose_requests_stop_and_never_renews_motion(self):
@@ -306,7 +317,7 @@ class ClosedLoopTests(unittest.TestCase):
                                     max_forward_cells=1),
         )
         navigator.prepare()
-        navigator.authorize()
+        navigator.authorize(shadow=True)
         navigator.step(self.observation(0), Telemetry(healthy=True, stopped=True), now=0.0)
         command = navigator.step(self.observation(0, age=2.0), Telemetry(healthy=True, stopped=False), now=1.0)
         self.assertEqual(navigator.state, NavigationState.WAIT_RELOCALIZATION)
@@ -318,7 +329,7 @@ class ClosedLoopTests(unittest.TestCase):
             config=ClosedLoopConfig(metric_scale=True, camera_mount_verified=True,
                                     up_verified=True, max_forward_cells=1),
         )
-        navigator.prepare(); navigator.authorize()
+        navigator.prepare(); navigator.authorize(shadow=True)
         first = navigator.step(self.observation(0), Telemetry(True, True), now=0.0)
         waiting = navigator.step(self.observation(0, age=2.0), Telemetry(True, False), now=1.0)
         self.assertEqual(waiting.primitive, "stop")
@@ -340,7 +351,7 @@ class ClosedLoopTests(unittest.TestCase):
                     config=ClosedLoopConfig(metric_scale=True, camera_mount_verified=True,
                                             up_verified=True, max_forward_cells=1),
                 )
-                navigator.prepare(); navigator.authorize()
+                navigator.prepare(); navigator.authorize(shadow=True)
                 first = navigator.step(self.observation(0), Telemetry(True, True), now=0.0)
                 navigator.step(self.observation(0, age=interval),
                                Telemetry(True, False, command_id=first.command_id,
@@ -356,7 +367,7 @@ class ClosedLoopTests(unittest.TestCase):
             config=ClosedLoopConfig(metric_scale=True, camera_mount_verified=True,
                                     up_verified=True, max_forward_cells=1),
         )
-        navigator.prepare(); navigator.authorize()
+        navigator.prepare(); navigator.authorize(shadow=True)
         first = navigator.step(self.observation(0), Telemetry(True, True), now=0.0)
         result = navigator.step(
             self.observation(0), Telemetry(True, False, command_id=first.command_id,
@@ -370,7 +381,7 @@ class ClosedLoopTests(unittest.TestCase):
             config=ClosedLoopConfig(metric_scale=True, camera_mount_verified=True,
                                     up_verified=True, max_forward_cells=1),
         )
-        navigator.prepare(); navigator.authorize()
+        navigator.prepare(); navigator.authorize(shadow=True)
         navigator.step(self.observation(0), Telemetry(True, True), now=0.0)
         self.assertEqual(navigator.pause("obstacle_wait").primitive, "stop")
         self.assertEqual(navigator.state, NavigationState.PAUSED)
@@ -411,7 +422,7 @@ class ClosedLoopTests(unittest.TestCase):
                                     max_forward_cells=1),
         )
         navigator.prepare()
-        navigator.authorize()
+        navigator.authorize(shadow=True)
         navigator.step(self.observation(0), Telemetry(healthy=True, stopped=True), now=0.0)
         command = navigator.manual_override("handheld_stop")
         self.assertEqual(command.primitive, "stop")
@@ -425,7 +436,7 @@ class ClosedLoopTests(unittest.TestCase):
                                     max_forward_cells=1),
         )
         navigator.prepare()
-        navigator.authorize()
+        navigator.authorize(shadow=True)
         navigator.step(self.observation(0), Telemetry(healthy=True, stopped=True), now=0.0)
         command = navigator.step(self.observation(0), Telemetry(healthy=False, stopped=False, fault="STALE_STATE"), now=1.0)
         self.assertEqual(command.primitive, "stop")
@@ -451,12 +462,14 @@ class ClosedLoopDeepRegressionTests(unittest.TestCase):
             source_time_s=float(int(frame[1:])), received_time_s=float(int(frame[1:])) + .01,
             localization_time_s=float(int(frame[1:])) + .005, map_version="map-v1",
             localization_quality=quality, target_visible=target_visible,
+            capture_time_s=float(int(frame[1:])) + 10.0,
+            capture_clock_id="sim-clock", capture_time_uncertainty_s=.01,
         )
 
     def test_same_frame_cannot_complete_forward_twice(self):
         route = plan_grid(self.grid, (1, 0), (2, 0))
         navigator = ClosedLoopNavigator(route, config=self.config, grid=self.grid)
-        navigator.prepare(); navigator.authorize()
+        navigator.prepare(); navigator.authorize(shadow=True)
         first = navigator.step(self.obs(10.15, 20.05, "E", "f1"),
                                Telemetry(True, True), now=0.0)
         self.assertEqual(first.primitive, "forward")
@@ -467,14 +480,18 @@ class ClosedLoopDeepRegressionTests(unittest.TestCase):
         self.assertEqual(navigator.index, 0)
         confirmed = navigator.step(self.obs(10.25, 20.05, "E", "f2", target_visible=True),
                                    Telemetry(True, True, command_id=first.command_id,
-                                             motion_feedback="stopped", feedback_time_s=.3), now=.3)
+                                             motion_feedback="stopped", feedback_time_s=.3,
+                                             motion_started_time_s=.1, motion_stopped_time_s=.2,
+                                             send_sequence=7, receiver_command_sequence=7,
+                                             feedback_clock_id="sim-clock", time_uncertainty_s=.01,
+                                             causal_feedback=True), now=.3)
         self.assertEqual(navigator.index, 1)
         self.assertNotEqual(confirmed.primitive, "forward")
 
     def test_turn_requires_new_frame_and_absolute_heading_before_next_action(self):
         route = plan_grid(self.grid, (1, 0), (1, 1), start_heading="E")
         navigator = ClosedLoopNavigator(route, config=self.config, grid=self.grid)
-        navigator.prepare(); navigator.authorize()
+        navigator.prepare(); navigator.authorize(shadow=True)
         turn = navigator.step(self.obs(10.15, 20.05, "E", "f1"),
                                Telemetry(True, True), now=0.0)
         self.assertEqual(turn.primitive, "turn_left")
@@ -486,14 +503,18 @@ class ClosedLoopDeepRegressionTests(unittest.TestCase):
         self.assertEqual(navigator.index, 0)
         confirmed = navigator.step(self.obs(10.15, 20.05, "N", "f2"),
                                    Telemetry(True, True, command_id=turn.command_id,
-                                              motion_feedback="stopped", feedback_time_s=.3), now=.3)
+                                             motion_feedback="stopped", feedback_time_s=.3,
+                                             motion_started_time_s=.1, motion_stopped_time_s=.2,
+                                             send_sequence=7, receiver_command_sequence=7,
+                                             feedback_clock_id="sim-clock", time_uncertainty_s=.01,
+                                             causal_feedback=True), now=.3)
         self.assertEqual(navigator.index, 1)
         self.assertNotEqual(confirmed.primitive, "turn_left")
 
     def test_command_timeout_enters_replanning_without_consuming_action(self):
         route = plan_grid(self.grid, (1, 0), (2, 0))
         navigator = ClosedLoopNavigator(route, config=self.config, grid=self.grid)
-        navigator.prepare(); navigator.authorize()
+        navigator.prepare(); navigator.authorize(shadow=True)
         command = navigator.step(self.obs(10.15, 20.05, "E", "f1"),
                                  Telemetry(True, True), now=0.0)
         stopped = navigator.step(self.obs(10.15, 20.05, "E", "f2"),
@@ -506,14 +527,65 @@ class ClosedLoopDeepRegressionTests(unittest.TestCase):
     def test_goal_requires_target_observation_before_arrived(self):
         route = plan_grid(self.grid, (1, 0), (2, 0))
         navigator = ClosedLoopNavigator(route, config=self.config, grid=self.grid)
-        navigator.prepare(); navigator.authorize()
+        navigator.prepare(); navigator.authorize(shadow=True)
         command = navigator.step(self.obs(10.15, 20.05, "E", "f1"),
                                  Telemetry(True, True), now=0.0)
         waiting = navigator.step(self.obs(10.25, 20.05, "E", "f2"),
                                  Telemetry(True, True, command_id=command.command_id,
-                                           motion_feedback="stopped"), now=.3)
+                                           motion_feedback="stopped", motion_started_time_s=.1,
+                                           motion_stopped_time_s=.2, send_sequence=7,
+                                           receiver_command_sequence=7,
+                                           feedback_clock_id="sim-clock", time_uncertainty_s=.01,
+                                           causal_feedback=True), now=.3)
         self.assertNotEqual(navigator.state, NavigationState.ARRIVED)
         self.assertIn(waiting.primitive, ("wait", "stop"))
+
+    def test_pnp_completed_after_command_cannot_confirm_pre_command_capture(self):
+        route = plan_grid(self.grid, (1, 0), (2, 0))
+        navigator = ClosedLoopNavigator(route, config=self.config, grid=self.grid)
+        navigator.prepare(); navigator.authorize(shadow=True)
+        command = navigator.step(self.obs(10.15, 20.05, "E", "f1"),
+                                 Telemetry(True, True), now=0.0)
+        old_capture = PoseObservation(
+            x=10.25, y=20.05, heading="E", received_age_s=0.0, localized=True,
+            frame_id="f2", capture_session_id="session-a", source_sequence=2,
+            source_time_s=.05, received_time_s=1.05, localization_time_s=1.0,
+            map_version="map-v1", localization_quality=.9,
+            capture_time_s=.05, capture_clock_id="sim-clock",
+            capture_time_uncertainty_s=.01,
+        )
+        result = navigator.step(
+            old_capture,
+            Telemetry(True, True, command_id=command.command_id,
+                      motion_feedback="stopped", motion_started_time_s=.2,
+                      motion_stopped_time_s=.8, send_sequence=7,
+                      receiver_command_sequence=7, feedback_clock_id="sim-clock",
+                      time_uncertainty_s=.01, causal_feedback=True),
+            now=.9,
+        )
+        self.assertEqual(result.primitive, "wait")
+        self.assertEqual(navigator.index, 0)
+
+    def test_unsynchronized_camera_clock_cannot_confirm_motion(self):
+        route = plan_grid(self.grid, (1, 0), (2, 0))
+        navigator = ClosedLoopNavigator(route, config=self.config, grid=self.grid)
+        navigator.prepare(); navigator.authorize(shadow=True)
+        command = navigator.step(self.obs(10.15, 20.05, "E", "f1"),
+                                 Telemetry(True, True), now=0.0)
+        observation = self.obs(10.25, 20.05, "E", "f2")
+        observation = PoseObservation(**{**observation.__dict__,
+                                         "capture_clock_id": "camera-clock"})
+        result = navigator.step(
+            observation,
+            Telemetry(True, True, command_id=command.command_id,
+                      motion_feedback="stopped", motion_started_time_s=.2,
+                      motion_stopped_time_s=.8, send_sequence=7,
+                      receiver_command_sequence=7, feedback_clock_id="sim-clock",
+                      time_uncertainty_s=.01, causal_feedback=True),
+            now=.9,
+        )
+        self.assertEqual(result.primitive, "wait")
+        self.assertEqual(navigator.index, 0)
 
 
 class ScenarioTests(unittest.TestCase):

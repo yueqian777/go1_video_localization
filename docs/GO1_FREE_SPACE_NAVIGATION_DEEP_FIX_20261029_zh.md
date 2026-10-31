@@ -66,6 +66,9 @@ results/navigation_upgrade_20261029/deep_fix_real_evidence_audit.json
 - 连续同向前进格子按 `max_forward_cells` 合并，默认最多 3 格；转角、路径断点和障碍区域仍保留独立动作。A* 主干没有修改。
 - `Telemetry` 明确区分 command id、执行中、实际停止、遥测时间、导航租约、人工接管、实际速度和 yaw 角速度。`predict_pose()` 只在不超过 0.5 秒的窗口内使用机身速度补齐短空缺，绝不把 `actual_yaw` 改写成绝对朝向，也不替代视觉全局修正。
 - `NavigationHttpClient` 增加 keepalive/pause/resume；暂停不保留非零意图，恢复不会重放旧 command。真实控制链仍没有自动 TAKE、ARM 或第二套 SDK。
+- 接收端新增导航反馈版本、能力集、运动命令序号和命令 ID，以及运动开始/停止时刻；PC 记录意图接受、MOVE 发送和接收确认。HTTP 状态读取时间只作为反馈到达时间，不能替代机器人实际停止时间。
+- 完成确认要求相机采集时间晚于机器人停止事件，并且相机与控制反馈处于可比较的时钟域；PnP 计算完成时间不能把运动前采集的旧画面变成新画面。
+- 真实运动需要可追溯的 `CalibrationEvidence`：米制尺度、重力、相机外参、地图朝向和证据 ID。`navigation_runner.py` 默认运行在 `SHADOW`，启动不连接、不 TAKE、不 ARM、不发送非零动作。
 - 远程仓库的 `tests/test_cross_repo_navigation.py` 使用原生模拟接收端、PC 服务和本仓库HTTP客户端验证授权—运动反馈—暂停—恢复—新动作—停止链路，并验证动作截止后不会继续续发。
 
 ## 验证结果
@@ -74,16 +77,16 @@ results/navigation_upgrade_20261029/deep_fix_real_evidence_audit.json
 
 ```text
 tools/run_tests.ps1
-Ran 613 tests ... OK
+Ran 628 tests ... OK
 ```
 
-新增自由空间和闭环回归共 37 项通过，A–K 离线场景全部通过，`motion_commands_sent=false`。控制仓库相关回归及跨仓库模拟集成共 12 项通过；MSYS2 下控制策略测试通过。
+新增自由空间、因果反馈和 Runner 回归共 43 项通过，A–K 离线场景全部通过，`motion_commands_sent=false`。控制仓库完整套件 54 项通过，权限定向套件 16 项通过；跨仓库原生模拟 HTTP 集成 1 项通过；MSYS2 下接收端静态编译通过。
 
 远程控制仓库在 MSYS2 g++ 模拟接收端下：
 
 ```text
-tests/test_system.py
-Ran 31 tests ... OK
+python -m unittest discover -s tests -p 'test_*.py'
+Ran 54 tests ... OK
 ```
 
 这些结果是离线/模拟验证，不是 Go1 实机行走验收。真实执行仍需要米制尺度、相机到机身外参、足底尺寸、实时目标证据、远程控制任务租约和现场人工急停条件。

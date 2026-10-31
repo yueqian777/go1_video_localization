@@ -34,6 +34,29 @@ class PrimitivePhase(str, Enum):
 
 
 @dataclass(frozen=True)
+class CalibrationEvidence:
+    """Evidence required before distance-based motion is authorized."""
+
+    metric_scale_m_per_cell: float | None = None
+    gravity_calibrated: bool = False
+    camera_extrinsics_verified: bool = False
+    heading_alignment_verified: bool = False
+    evidence_id: str | None = None
+    measured_time_s: float | None = None
+
+    def valid_for_motion(self) -> bool:
+        return (
+            isinstance(self.metric_scale_m_per_cell, (int, float))
+            and math.isfinite(float(self.metric_scale_m_per_cell))
+            and float(self.metric_scale_m_per_cell) > 0
+            and self.gravity_calibrated is True
+            and self.camera_extrinsics_verified is True
+            and self.heading_alignment_verified is True
+            and bool(self.evidence_id)
+        )
+
+
+@dataclass(frozen=True)
 class ClosedLoopConfig:
     metric_scale: bool
     camera_mount_verified: bool
@@ -48,6 +71,8 @@ class ClosedLoopConfig:
     resume_window_s: float = 5.0
     forward_cell_duration_s: float = .35
     turn_intent_duration_s: float = .7
+    calibration_evidence: CalibrationEvidence | None = None
+    min_position_progress_m: float = .03
 
     def __post_init__(self):
         for value, name in ((self.max_pose_age_s, "max_pose_age_s"),
@@ -55,11 +80,15 @@ class ClosedLoopConfig:
                             (self.min_localization_quality, "min_localization_quality"),
                             (self.resume_window_s, "resume_window_s"),
                             (self.forward_cell_duration_s, "forward_cell_duration_s"),
-                            (self.turn_intent_duration_s, "turn_intent_duration_s")):
+                            (self.turn_intent_duration_s, "turn_intent_duration_s"),
+                            (self.min_position_progress_m, "min_position_progress_m")):
             if not math.isfinite(float(value)) or float(value) < 0:
                 raise ValueError(f"{name}_invalid")
         if isinstance(self.max_forward_cells, bool) or int(self.max_forward_cells) < 1:
             raise ValueError("max_forward_cells_invalid")
+        if self.calibration_evidence is not None and not isinstance(
+                self.calibration_evidence, CalibrationEvidence):
+            raise ValueError("calibration_evidence_invalid")
 
 
 @dataclass(frozen=True)
@@ -78,6 +107,9 @@ class PoseObservation:
     map_version: str | None = None
     localization_quality: float | None = None
     target_visible: bool = False
+    capture_time_s: float | None = None
+    capture_clock_id: str | None = None
+    capture_time_uncertainty_s: float | None = None
 
 
 @dataclass(frozen=True)
@@ -100,6 +132,18 @@ class Telemetry:
     motion_stopped: bool | None = None
     navigation_active: bool = True
     navigation_paused: bool = False
+    command_created_time_s: float | None = None
+    intent_accepted_time_s: float | None = None
+    move_sent_time_s: float | None = None
+    receiver_ack_time_s: float | None = None
+    motion_started_time_s: float | None = None
+    motion_stopped_time_s: float | None = None
+    send_sequence: int | None = None
+    receiver_command_sequence: int | None = None
+    receiver_clock_id: str | None = None
+    feedback_clock_id: str | None = None
+    time_uncertainty_s: float = 0.0
+    causal_feedback: bool = False
 
 
 @dataclass(frozen=True)
@@ -197,6 +241,7 @@ class ClosedLoopNavigator:
         self.current_command_id: str | None = None
         self.command_started_at: float | None = None
         self.command_start_observation_key = None
+        self.command_start_pose = None
         self.last_observation_key = None
         self.last_clock: float | None = None
         self.command_counter = 0
@@ -214,9 +259,12 @@ class ClosedLoopNavigator:
             raise ValueError("route_not_executable")
         self.state = NavigationState.PREPARED
 
-    def authorize(self):
-        if not (self.config.metric_scale and self.config.camera_mount_verified and self.config.up_verified):
-            raise PermissionError("execution_calibration_gate_failed")
+    def authorize(self, *, shadow: bool = False):
+        if not shadow and not (
+                self.config.metric_scale and self.config.camera_mount_verified
+                and self.config.up_verified and self.config.calibration_evidence
+                and self.config.calibration_evidence.valid_for_motion()):
+            raise PermissionError("execution_calibration_evidence_required")
         if self.state is not NavigationState.PREPARED:
             raise PermissionError("navigation_not_prepared")
         self.authorized = True
@@ -283,7 +331,13 @@ class ClosedLoopNavigator:
         return True
 
     def _feedback_matches(self, telemetry: Telemetry) -> bool:
+        if not telemetry.causal_feedback:
+            return False
         if telemetry.command_id is not None and telemetry.command_id != self.current_command_id:
+            return False
+        if (telemetry.send_sequence is None
+                or telemetry.receiver_command_sequence != telemetry.send_sequence
+                or telemetry.motion_started_time_s is None):
             return False
         if not self.identity_required:
             return telemetry.healthy and (telemetry.stopped or telemetry.motion_feedback in _FEEDBACK_OK)
@@ -291,6 +345,24 @@ class ClosedLoopNavigator:
                 and telemetry.motion_feedback in _FEEDBACK_OK
                 and telemetry.feedback_time_s is not None
                 and (self.command_started_at is None or telemetry.feedback_time_s >= self.command_started_at))
+
+    def _observation_is_after_stop(self, observation: PoseObservation,
+                                   telemetry: Telemetry) -> bool:
+        if (observation.capture_time_s is None or observation.capture_clock_id is None
+                or telemetry.feedback_clock_id is None
+                or observation.capture_clock_id != telemetry.feedback_clock_id
+                or telemetry.motion_stopped_time_s is None
+                or telemetry.motion_started_time_s is None
+                or not telemetry.causal_feedback):
+            return False
+        uncertainty = observation.capture_time_uncertainty_s
+        if uncertainty is None or not math.isfinite(float(uncertainty)) or uncertainty < 0:
+            return False
+        if (not math.isfinite(float(telemetry.time_uncertainty_s))
+                or telemetry.time_uncertainty_s < 0):
+            return False
+        return (observation.capture_time_s - float(uncertainty)
+                > telemetry.motion_stopped_time_s + telemetry.time_uncertainty_s)
 
     @staticmethod
     def _safe_telemetry(telemetry: Telemetry) -> bool:
@@ -301,7 +373,8 @@ class ClosedLoopNavigator:
     def _confirm_current(self, observation: PoseObservation, telemetry: Telemetry):
         action = self.current_action
         stopped = telemetry.motion_stopped if telemetry.motion_stopped is not None else telemetry.stopped
-        if action is None or not self._feedback_matches(telemetry) or not stopped:
+        if (action is None or not self._feedback_matches(telemetry) or not stopped
+                or not self._observation_is_after_stop(observation, telemetry)):
             return False
         key = self._observation_key(observation)
         if key == self.command_start_observation_key or key == self.last_observation_key:
@@ -312,12 +385,19 @@ class ClosedLoopNavigator:
         elif action.primitive == "forward" and action.cell is not None:
             if self.grid.world_to_cell(observation.x, observation.y) != action.cell:
                 return False
+            if self.command_start_pose is None:
+                return False
+            distance = math.hypot(observation.x - self.command_start_pose[0],
+                                  observation.y - self.command_start_pose[1])
+            if distance < self.config.min_position_progress_m:
+                return False
         self.index += 1
         self.last_observation_key = key
         self.current_action = None
         self.current_command_id = None
         self.command_started_at = None
         self.command_start_observation_key = None
+        self.command_start_pose = None
         self.phase = PrimitivePhase.CONFIRMED
         self.pending_observation_target = None
         if self.index >= len(self.route.actions):
@@ -339,6 +419,7 @@ class ClosedLoopNavigator:
         self.current_command_id = None
         self.command_started_at = None
         self.command_start_observation_key = None
+        self.command_start_pose = None
         self.pending_observation_target = None
         self.awaiting_goal_observation = False
         self.failure_reason = None
@@ -352,6 +433,7 @@ class ClosedLoopNavigator:
         self.current_command_id = None
         self.command_started_at = None
         self.command_start_observation_key = None
+        self.command_start_pose = None
         self.phase = PrimitivePhase.STOP_REQUESTED
         self.failure_reason = reason
         self.state = NavigationState.PAUSED
@@ -409,6 +491,7 @@ class ClosedLoopNavigator:
             self.current_command_id = None
             self.command_started_at = None
             self.command_start_observation_key = None
+            self.command_start_pose = None
             self.phase = PrimitivePhase.STOP_REQUESTED
             self.failure_reason = "observation_or_localization_not_ready"
             self.state = NavigationState.WAIT_RELOCALIZATION
@@ -437,6 +520,7 @@ class ClosedLoopNavigator:
                 self.current_command_id = None
                 self.command_started_at = None
                 self.command_start_observation_key = None
+                self.command_start_pose = None
                 self.phase = PrimitivePhase.FAILED
                 return self._stop(NavigationState.REPLANNING, "primitive_timeout")
             if telemetry.motion_feedback == "executing":
@@ -465,6 +549,7 @@ class ClosedLoopNavigator:
             raise ValueError("unsupported_motion_primitive")
         issued = self._new_command(action, now)
         self.command_start_observation_key = self._observation_key(observation)
+        self.command_start_pose = (observation.x, observation.y)
         if issued.primitive == "forward" and issued.cell is not None:
             self.pending_observation_target = issued.cell
         return issued
