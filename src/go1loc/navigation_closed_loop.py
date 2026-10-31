@@ -53,6 +53,9 @@ class CalibrationEvidence:
             and self.camera_extrinsics_verified is True
             and self.heading_alignment_verified is True
             and bool(self.evidence_id)
+            and isinstance(self.measured_time_s, (int, float))
+            and math.isfinite(float(self.measured_time_s))
+            and float(self.measured_time_s) >= 0
         )
 
 

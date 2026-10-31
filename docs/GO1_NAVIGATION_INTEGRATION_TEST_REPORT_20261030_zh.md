@@ -1,6 +1,6 @@
 # Go1 导航控制跨仓库集成测试报告
 
-日期：2026-10-30
+日期：2026-10-31
 范围：`go1_video_localization` 与 `go1_remote_control` 的离线集成修改
 
 ## 结论

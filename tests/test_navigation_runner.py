@@ -81,7 +81,7 @@ class NavigationRunnerTests(unittest.TestCase):
         self.assertEqual(adapter.calls, [])
 
     def test_live_requires_operator_and_calibration_evidence(self):
-        evidence = CalibrationEvidence(1.0, True, True, True, "field-20261030")
+        evidence = CalibrationEvidence(1.0, True, True, True, "field-20261030", 1.0)
         navigator = route_and_navigator()
         adapter = FakeAdapter(simulation=False)
         runner = NavigationRunner(
